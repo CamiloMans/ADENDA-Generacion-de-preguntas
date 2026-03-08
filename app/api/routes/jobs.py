@@ -15,6 +15,7 @@ from app.core.config import get_settings
 from app.core.security import require_api_key
 from app.db.models import Job
 from app.db.session import get_db
+from app.services.google_drive_service import DriveServiceError, GoogleDriveService
 from app.services import job_service
 from app.services.storage_service import (
     ALLOWED_PDF_CONTENT_TYPES,
@@ -38,9 +39,11 @@ def _must_get_job(db: Session, job_id: UUID) -> Job:
 def _job_status_payload(job: Job) -> JobStatusResponse:
     return JobStatusResponse(
         job_id=job.id,
+        adenda_id=job.adenda_id,
         status=job.status,
         progress=job.progress,
         stage=job.stage,
+        drive_folder_url=job.drive_folder_url,
         error_code=job.error_code,
         error_message=job.error_message,
         created_at=job.created_at,
@@ -50,20 +53,40 @@ def _job_status_payload(job: Job) -> JobStatusResponse:
     )
 
 
-def _artifact_file_response(db: Session, job_id: UUID, filename: str) -> FileResponse:
+def _artifact_file_response(db: Session, job_id: UUID, filename: str) -> Response:
     artifact = job_service.get_artifact(db, job_id=job_id, name=filename)
     if not artifact:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Artifact '{filename}' not found.")
+    media_type = "application/json" if filename.endswith(".json") else None
+    if artifact.storage_backend == "drive":
+        if not artifact.external_file_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Artifact file '{filename}' missing remote file id.",
+            )
+        try:
+            drive_service = GoogleDriveService.from_settings()
+            content = drive_service.download_file_bytes(artifact.external_file_id)
+        except DriveServiceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Could not retrieve artifact '{filename}' from Google Drive.",
+            ) from exc
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return Response(content=content, media_type=artifact.mime_type or media_type, headers=headers)
+
+    if not artifact.path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Artifact file '{filename}' missing.")
     path = Path(artifact.path)
     if not path.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Artifact file '{filename}' missing.")
-    media_type = "application/json" if filename.endswith(".json") else None
-    return FileResponse(path=path, filename=filename, media_type=media_type)
+    return FileResponse(path=path, filename=filename, media_type=artifact.mime_type or media_type)
 
 
 @router.post("", response_model=JobCreateResponse, status_code=status.HTTP_202_ACCEPTED)
 async def create_job(
     file: UploadFile = File(...),
+    id_adenda: int = Form(...),
     classify: bool = Form(default=True),
     include_png: bool = Form(default=True),
     db: Session = Depends(get_db),
@@ -73,6 +96,16 @@ async def create_job(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only PDF uploads are allowed.",
+        )
+    if not classify:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This endpoint requires classify=true.",
+        )
+    if not include_png:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This endpoint requires include_png=true.",
         )
 
     try:
@@ -98,6 +131,7 @@ async def create_job(
     job = job_service.create_job(
         db,
         job_id=job_id,
+        adenda_id=id_adenda,
         original_filename=file.filename or "upload.pdf",
         content_type=file.content_type or "application/pdf",
         file_size_bytes=size_bytes,
@@ -113,12 +147,13 @@ async def create_job(
         )
     except Exception as exc:  # noqa: BLE001
         job_service.mark_failed(db, job, error_code="QUEUE_ERROR", error_message=str(exc))
+        remove_job_dir(settings.data_dir, job_id=job.id)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Could not enqueue job.",
         ) from exc
 
-    return JobCreateResponse(job_id=job.id, status=job.status, created_at=job.created_at)
+    return JobCreateResponse(job_id=job.id, adenda_id=job.adenda_id, status=job.status, created_at=job.created_at)
 
 
 @router.get("/{job_id}", response_model=JobStatusResponse)
@@ -148,14 +183,16 @@ def get_job_result(job_id: UUID, request: Request, db: Session = Depends(get_db)
     }
     return JobResultResponse(
         job_id=job.id,
+        adenda_id=job.adenda_id,
         status=job.status,
+        drive_folder_url=job.drive_folder_url,
         artifacts=artifacts,
         summary=job.summary,
     )
 
 
 @router.get("/{job_id}/result/preguntas_clasificadas.json")
-def get_result_preguntas_clasificadas(job_id: UUID, db: Session = Depends(get_db)) -> FileResponse:
+def get_result_preguntas_clasificadas(job_id: UUID, db: Session = Depends(get_db)) -> Response:
     job = _must_get_job(db, job_id)
 
     if job.status == "expired":
@@ -172,7 +209,7 @@ def get_result_preguntas_clasificadas(job_id: UUID, db: Session = Depends(get_db
 
 
 @router.get("/{job_id}/artifacts/{filename}")
-def get_job_artifact(job_id: UUID, filename: str, db: Session = Depends(get_db)) -> FileResponse:
+def get_job_artifact(job_id: UUID, filename: str, db: Session = Depends(get_db)) -> Response:
     validate_artifact_name(filename)
     _must_get_job(db, job_id)
     return _artifact_file_response(db, job_id, filename)

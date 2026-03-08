@@ -9,15 +9,18 @@ from pydantic import BaseModel
 
 class JobCreateResponse(BaseModel):
     job_id: UUID
+    adenda_id: int
     status: str
     created_at: datetime
 
 
 class JobStatusResponse(BaseModel):
     job_id: UUID
+    adenda_id: int
     status: str
     progress: int
     stage: str
+    drive_folder_url: str | None = None
     error_code: str | None = None
     error_message: str | None = None
     created_at: datetime
@@ -39,6 +42,8 @@ class JobResultSummary(BaseModel):
 
 class JobResultResponse(BaseModel):
     job_id: UUID
+    adenda_id: int
     status: str
+    drive_folder_url: str | None = None
     artifacts: dict[str, str]
     summary: JobResultSummary | dict[str, Any] | None = None

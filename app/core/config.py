@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     cors_origins: str = ""
     cors_allow_all: bool = False
+    google_client_secret_file: Path = Path("client_secret.json")
+    google_token_file: Path = Path("token.json")
+    google_drive_parent_folder_id: str = ""
 
     @property
     def api_key_set(self) -> set[str]:

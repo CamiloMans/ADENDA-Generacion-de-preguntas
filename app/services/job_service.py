@@ -21,6 +21,7 @@ def create_job(
     db: Session,
     *,
     job_id: UUID,
+    adenda_id: int,
     original_filename: str,
     content_type: str,
     file_size_bytes: int,
@@ -29,6 +30,7 @@ def create_job(
 ) -> Job:
     job = Job(
         id=job_id,
+        adenda_id=adenda_id,
         status="queued",
         stage="queued",
         progress=0,
@@ -46,6 +48,13 @@ def create_job(
 
 def get_job(db: Session, job_id: UUID) -> Job | None:
     return db.get(Job, job_id)
+
+
+def list_jobs_by_adenda(db: Session, adenda_id: int, *, exclude_job_id: UUID | None = None) -> list[Job]:
+    stmt = select(Job).where(Job.adenda_id == adenda_id).order_by(Job.created_at.desc())
+    if exclude_job_id is not None:
+        stmt = stmt.where(Job.id != exclude_job_id)
+    return list(db.scalars(stmt).all())
 
 
 def list_expired_jobs(db: Session, now: datetime) -> list[Job]:
@@ -132,16 +141,24 @@ def add_artifact(
     *,
     job_id: UUID,
     name: str,
-    path: Path,
+    path: Path | None = None,
     size_bytes: int,
     sha256: str | None = None,
+    storage_backend: str = "local",
+    mime_type: str | None = None,
+    external_url: str | None = None,
+    external_file_id: str | None = None,
 ) -> JobArtifact:
     artifact = JobArtifact(
         job_id=job_id,
         name=name,
-        path=str(path),
+        path=str(path) if path else None,
         size_bytes=size_bytes,
         sha256=sha256,
+        storage_backend=storage_backend,
+        mime_type=mime_type,
+        external_url=external_url,
+        external_file_id=external_file_id,
     )
     db.add(artifact)
     db.commit()

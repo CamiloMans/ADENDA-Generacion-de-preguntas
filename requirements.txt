@@ -10,4 +10,7 @@ pydantic-settings==2.6.1
 python-multipart==0.0.12
 PyMuPDF==1.27.1
 python-dotenv==1.0.1
+google-api-python-client==2.164.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
 pytest==8.3.4

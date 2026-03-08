@@ -2,10 +2,10 @@
 
 FastAPI backend to process ICSARA PDFs asynchronously:
 
-1. Upload PDF -> create job.
+1. Upload PDF + `id_adenda` -> create job.
 2. Worker extracts questions/tables/figures.
-3. Optional classification by taxonomy.
-4. Poll job status and download artifacts.
+3. Worker classifies questions, uploads JSON/PNGs to Google Drive, and persists questions/media in PostgreSQL.
+4. Poll job status and download the classified JSON artifact.
 
 ## Features
 
@@ -18,7 +18,8 @@ FastAPI backend to process ICSARA PDFs asynchronously:
 - API key auth via `X-API-Key`
 - Redis queue + Celery worker
 - PostgreSQL state persistence (Supabase compatible)
-- Local disk artifact storage with TTL cleanup
+- Google Drive artifact storage for classified JSON + PNG media
+- Local disk used only as temporary staging during processing
 
 ## Required environment
 
@@ -28,6 +29,9 @@ Copy `.env.example` to `.env` and set:
 - `DATABASE_URL` (Supabase/PostgreSQL URL)
 - `REDIS_URL`
 - `DATA_DIR`
+- `GOOGLE_CLIENT_SECRET_FILE`
+- `GOOGLE_TOKEN_FILE`
+- `GOOGLE_DRIVE_PARENT_FOLDER_ID`
 - `CORS_ALLOW_ALL` (`true` for temporary wildcard CORS, otherwise use `CORS_ORIGINS`)
 
 ## Run locally (without Docker)
@@ -70,15 +74,18 @@ Optional Nginx reverse proxy:
 docker compose -f docker-compose.yml -f deploy/nginx/docker-compose.nginx.yml up -d --build
 ```
 
+## Request contract
+
+`POST /v1/jobs` uses `multipart/form-data` with:
+
+- `file` (PDF)
+- `id_adenda` (integer, required)
+- `classify=true`
+- `include_png=true`
+
 ## Job artifact names
 
-- `preguntas.json`
-- `preguntas.txt`
-- `chapters_hinges.json`
-- `texto_total.txt`
 - `preguntas_clasificadas.json`
-- `preguntas_clasificadas_detalle.json`
-- `outputs_png.zip`
 
 ## Cleanup expired jobs
 
