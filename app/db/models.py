@@ -83,16 +83,24 @@ class Question(Base):
     job_id: Mapped[UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
     adenda_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     numero: Mapped[int] = mapped_column(Integer, nullable=False)
+    observation_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    orden: Mapped[int | None] = mapped_column(Integer, nullable=True)
     capitulo: Mapped[str] = mapped_column(Text, nullable=False, default="")
     bisagra: Mapped[str | None] = mapped_column(Text, nullable=True)
+    section_1: Mapped[str | None] = mapped_column(Text, nullable=True)
+    section_2: Mapped[str | None] = mapped_column(Text, nullable=True)
     texto: Mapped[str] = mapped_column(Text, nullable=False)
+    requirement_types: Mapped[list[str] | None] = mapped_column(_json_type(), nullable=True)
     tema_principal: Mapped[str | None] = mapped_column(Text, nullable=True)
     tema_principal_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    clasificacion_json: Mapped[dict[str, Any] | None] = mapped_column(_json_type(), nullable=True)
     temas_principales: Mapped[list[str] | None] = mapped_column(_json_type(), nullable=True)
     temas_principales_id: Mapped[list[str] | None] = mapped_column(_json_type(), nullable=True)
+    temas_principales_json: Mapped[list[dict[str, Any]] | None] = mapped_column(_json_type(), nullable=True)
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
     temas_secundarios: Mapped[list[dict[str, Any]] | None] = mapped_column(_json_type(), nullable=True)
     keywords_match: Mapped[list[str] | None] = mapped_column(_json_type(), nullable=True)
+    raw_question_json: Mapped[dict[str, Any] | None] = mapped_column(_json_type(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     job: Mapped[Job] = relationship(back_populates="questions")
@@ -104,7 +112,10 @@ class Question(Base):
 
     __table_args__ = (
         UniqueConstraint("job_id", "numero", name="uq_preguntas_job_id_numero"),
+        UniqueConstraint("job_id", "observation_id", name="uq_preguntas_job_id_observation_id"),
         Index("ix_preguntas_adenda_id_numero", "adenda_id", "numero"),
+        Index("ix_preguntas_adenda_id_observation_id", "adenda_id", "observation_id"),
+        Index("ix_preguntas_adenda_id_orden", "adenda_id", "orden"),
     )
 
 
@@ -116,6 +127,8 @@ class QuestionMedia(Base):
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     tipo: Mapped[str] = mapped_column(String(32), nullable=False)
     parte: Mapped[int] = mapped_column(Integer, nullable=False)
+    caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    table_rows: Mapped[list[Any] | None] = mapped_column(_json_type(), nullable=True)
     mime_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     drive_file_id: Mapped[str] = mapped_column(String(255), nullable=False)
     drive_preview_url: Mapped[str] = mapped_column(String(2048), nullable=False)

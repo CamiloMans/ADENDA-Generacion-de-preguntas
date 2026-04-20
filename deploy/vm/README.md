@@ -79,7 +79,15 @@ Edit `.env` and set real values:
 - keep `REDIS_URL=redis://redis:6379/0`
 - keep `DATA_DIR=/data/jobs`
 - keep `CELERY_CONCURRENCY=1`
+- `GOOGLE_CLIENT_SECRET_FILE`
+- `GOOGLE_TOKEN_FILE`
+- `GOOGLE_DRIVE_PARENT_FOLDER_ID`
+- `ANTHROPIC_API_KEY`
+- `ANTHROPIC_MODEL`
+- keep `ANTHROPIC_PDF_DPI=150` unless you need a different review DPI
 - keep `CORS_ALLOW_ALL=true` (temporary)
+
+Ensure `client_secret.json` and `token.json` are present in the app directory before deployment.
 
 Protect secrets:
 

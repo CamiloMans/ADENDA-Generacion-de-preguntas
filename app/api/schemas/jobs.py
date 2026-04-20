@@ -31,13 +31,15 @@ class JobStatusResponse(BaseModel):
 
 class JobResultSummary(BaseModel):
     pages: int | None = None
-    preguntas: int | None = None
+    observaciones: int | None = None
     tablas: int | None = None
-    figuras: int | None = None
-    capitulos: int | None = None
-    bisagras: int | None = None
-    classified: int | None = None
-    unclassified: int | None = None
+    imagenes: int | None = None
+    clasificadas: int | None = None
+    sin_clasificar: int | None = None
+    ids_faltantes_detectados: int | None = None
+    ids_extraidas_desde_pdf: int | None = None
+    ids_no_localizadas: int | None = None
+    correcciones_revision: int | None = None
 
 
 class JobResultResponse(BaseModel):

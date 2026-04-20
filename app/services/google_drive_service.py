@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -43,10 +44,17 @@ class DriveFileRef:
 
 
 @dataclass(slots=True)
+class DriveRunContext:
+    adenda_folder: DriveFolder
+    run_folder: DriveFolder
+    media_folder: DriveFolder
+
+
+@dataclass(slots=True)
 class DriveUploadBundle:
     adenda_folder: DriveFolder
     run_folder: DriveFolder
-    json_file: DriveFileRef
+    artifact_files: dict[str, DriveFileRef]
     media_files: dict[str, DriveFileRef]
 
 
@@ -89,47 +97,76 @@ class GoogleDriveService:
         service = build("drive", "v3", credentials=creds, cache_discovery=False)
         return cls(service)
 
-    def upload_job_outputs(self, *, adenda_id: int, job_id: UUID, classified_json_path: Path, media_dir: Path) -> DriveUploadBundle:
+    def create_job_run_context(self, *, adenda_id: int, job_id: UUID) -> DriveRunContext:
         settings = get_settings()
         parent_folder_id = settings.google_drive_parent_folder_id.strip()
         if not parent_folder_id:
             raise DriveServiceError("GOOGLE_DRIVE_PARENT_FOLDER_ID is required.")
-        if not classified_json_path.exists():
-            raise DriveServiceError(f"Missing classified JSON output: {classified_json_path}")
 
         adenda_folder = self.ensure_folder(name=f"adenda_{adenda_id}", parent_id=parent_folder_id)
         run_folder = self.create_folder(name=f"run_{job_id}", parent_id=adenda_folder.folder_id)
-        try:
-            media_folder = self.create_folder(name="media", parent_id=run_folder.folder_id)
+        media_folder = self.create_folder(name="media", parent_id=run_folder.folder_id)
+        return DriveRunContext(
+            adenda_folder=adenda_folder,
+            run_folder=run_folder,
+            media_folder=media_folder,
+        )
 
-            json_file = self.upload_file(
-                path=classified_json_path,
-                parent_id=run_folder.folder_id,
-                mime_type="application/json",
+    def upload_job_outputs(self, *, adenda_id: int, job_id: UUID, classified_json_path: Path, media_dir: Path) -> DriveUploadBundle:
+        if not classified_json_path.exists():
+            raise DriveServiceError(f"Missing classified JSON output: {classified_json_path}")
+
+        context = self.create_job_run_context(adenda_id=adenda_id, job_id=job_id)
+        try:
+            artifact_files = self.upload_artifact_files(
+                files=[classified_json_path],
+                parent_id=context.run_folder.folder_id,
+            )
+            media_files = self.upload_directory_files(
+                directory=media_dir,
+                parent_id=context.media_folder.folder_id,
             )
 
-            media_files: dict[str, DriveFileRef] = {}
-            if media_dir.exists():
-                for file_path in sorted(media_dir.glob("*.png")):
-                    uploaded = self.upload_file(
-                        path=file_path,
-                        parent_id=media_folder.folder_id,
-                        mime_type="image/png",
-                    )
-                    media_files[file_path.name] = uploaded
-
             return DriveUploadBundle(
-                adenda_folder=adenda_folder,
-                run_folder=run_folder,
-                json_file=json_file,
+                adenda_folder=context.adenda_folder,
+                run_folder=context.run_folder,
+                artifact_files=artifact_files,
                 media_files=media_files,
             )
         except Exception:
             try:
-                self.delete_file(run_folder.folder_id)
+                self.delete_file(context.run_folder.folder_id)
             except DriveServiceError:
                 pass
             raise
+
+    def upload_directory_files(self, *, directory: Path, parent_id: str) -> dict[str, DriveFileRef]:
+        uploaded_files: dict[str, DriveFileRef] = {}
+        if not directory.exists():
+            return uploaded_files
+
+        for file_path in sorted(directory.glob("*")):
+            if not file_path.is_file():
+                continue
+            mime_type = _guess_mime_type(file_path)
+            uploaded_files[str(file_path.resolve())] = self.upload_file(
+                path=file_path,
+                parent_id=parent_id,
+                mime_type=mime_type,
+            )
+        return uploaded_files
+
+    def upload_artifact_files(self, *, files: list[Path], parent_id: str) -> dict[str, DriveFileRef]:
+        uploaded_files: dict[str, DriveFileRef] = {}
+        for file_path in files:
+            if not file_path.exists():
+                raise DriveServiceError(f"Missing artifact output: {file_path}")
+            uploaded_files[file_path.name] = self.upload_file(
+                path=file_path,
+                parent_id=parent_id,
+                mime_type=_guess_mime_type(file_path),
+            )
+        return uploaded_files
 
     def ensure_folder(self, *, name: str, parent_id: str) -> DriveFolder:
         escaped_name = name.replace("'", "\\'")
@@ -240,3 +277,8 @@ class GoogleDriveService:
     @staticmethod
     def file_download_url(file_id: str) -> str:
         return f"https://drive.google.com/uc?id={file_id}&export=download"
+
+
+def _guess_mime_type(path: Path) -> str:
+    mime_type, _ = mimetypes.guess_type(path.name)
+    return mime_type or "application/octet-stream"

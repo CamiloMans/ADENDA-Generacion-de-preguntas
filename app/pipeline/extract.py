@@ -1,960 +1,2354 @@
-"""ICSARA (SEIA) — Extracción heurística desde PDF a JSON
-
-Descripción:
-Proceso heurístico desarrollado para transformar un ICSARA en formato PDF en un dataset
-estructurado, trazable y reutilizable. El sistema no se basa en marcadores formales del
-documento, sino que **determina** capítulos, bisagras, preguntas y elementos gráficos a
-partir de patrones de layout, tipografía, posición relativa y continuidad entre páginas.
-
-Flujo:
-  1. Abrir el PDF una única vez y recorrerlo secuencialmente por página.
-  2. Determinar tablas vectoriales y figuras raster mediante heurísticas de layout
-     (detección por bounding boxes y características gráficas).
-  3. Recortar y exportar cada tabla/figura a PNG con nomenclatura estable:
-       p{numero_pregunta}_parte{N}_{tabla|figura}.png
-  4. Extraer texto plano excluyendo heurísticamente las áreas ocupadas por tablas y figuras,
-     evitando duplicación de contenido y ruido visual.
-  5. Determinar capítulos mediante heurísticas tipográficas (romanos en negrita, tamaño de
-     fuente, posición) y resolver continuidad entre páginas (cross-page).
-  6. Determinar bisagras mediante patrones de layout y semántica superficial, asociándolas
-     a las preguntas correspondientes.
-  7. Limpiar heurísticamente artefactos no textuales: firmas digitales, encabezados
-     repetidos y bisagras residuales.
-  8. Consolidar cada pregunta en una estructura consistente con su capítulo, bisagra,
-     texto limpio y referencias a tablas/figuras asociadas.
-
-Salidas:
-  - preguntas.json
-      Dataset estructurado por pregunta:
-      {capitulo, bisagra, numero, texto,
-       tablas_figuras:[{tipo, parte, png}]}
-
-  - preguntas.txt
-      Representación legible y continua del contenido textual.
-
-  - outputs_png/
-      Recortes de tablas y figuras con trazabilidad directa a cada pregunta.
-
-  - chapters_hinges.json
-      Archivo de apoyo para validación y depuración de las heurísticas de detección.
-"""
-
-import os
+﻿import os
 import re
 import json
-from typing import Any
-from bisect import bisect_right
-from collections import Counter, defaultdict
 from pathlib import Path
-import fitz  # pymupdf
+from collections import defaultdict
+from typing import List, Dict, Any, Optional, Tuple
+
+import fitz  # PyMuPDF
+
+from app.pipeline.types import ExtractionSummary
+
+# =========================================================
+# NUEVO: pdfplumber como motor principal de tablas
+# =========================================================
+try:
+    import pdfplumber
+    PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    PDFPLUMBER_AVAILABLE = False
 
 
-# =============================================================================
-# CONFIG
-# =============================================================================
-BASE_DIR = Path(os.getenv("ICSARA_BASE_DIR", str(Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd())))
-PDF_PATH = Path(os.getenv("ICSARA_PDF_PATH", str(BASE_DIR / "1766432953_2167380849.pdf")))
-OUT_DIR = Path(os.getenv("ICSARA_OUT_DIR", str(BASE_DIR / "salida_icsara")))
-SEPARADOR_PREGUNTA = "------------"
-
-# --- Texto ---
-PAT_PREGUNTA = re.compile(r"(?m)^\s*(\d{1,4})\.\s+")
-FRASES_RUIDO = [
-    "Para validar las firmas de este documento",
-    "sea.gob.cl/validar", "validar las firmas",
-    "https://validador.sea.gob.cl/validar",
-    "Firmado Digitalmente", "sellodigital.sea.gob.cl",
-    "Razón:", "Razon:",
-]
-FIRMA_TOKENS = (
-    "firmado digitalmente", "sellodigital", "utc",
-    "fecha:", "razón", "razon", "lugar:",
-)
-MIN_RATIO_FRECUENTES = 0.60
-YEAR_MIN, YEAR_MAX = 1900, 2100
-MONO_DROP_THRESHOLD = 5
-
-RE_CAP_ROM_TIT = re.compile(r"^\s*([IVXLCDM]{1,10})\.\s+(.+?)\s*$", re.IGNORECASE)
-RE_CAP_ROM_SOLO = re.compile(r"^\s*([IVXLCDM]{1,10})\.\s*$", re.IGNORECASE)
-RE_NUM_SOLO = re.compile(r"^\s*\d{1,4}\.\s*$")
-
-RE_TABLA_PARTES = re.compile(r"(?i)^\s*Tabla\s+XX\.\s*Partes\s+y\s+obras\s+del\s+Proyecto\s*$")
-RE_NOMBRE_PARTE = re.compile(r"^\s*\[(Nombre\s+parte/obra\s+.+?)\]\s*$", re.IGNORECASE)
-RE_CARACTER = re.compile(r"^\s*\[(Temporal\s+o\s+permanente)\]\s*$", re.IGNORECASE)
-RE_FASE = re.compile(r"^\s*\[(Construcción.*?cierre)\]\s*$", re.IGNORECASE)
-
-RE_FIRMA_BLOQUE = re.compile(
-    r"(?:Fecha:\s*\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\s+\d{1,2}:\d{2}[:\d.]*\s*(?:UTC\s*[+-]?\d{2}:\d{2})?\s*(?:Lugar:\s*)?)+",
-    re.IGNORECASE,
-)
-RE_FIRMA_COMPLETA = re.compile(r"(?:Firmado\s+Digitalmente\s+por\s+.+?)(?=\n|$)", re.IGNORECASE)
-RE_FECHA_PRE_FIRMA = re.compile(r"\d{1,2}\s+de\s+\w+\s+de\s+\d{4}\.\s*$", re.IGNORECASE)
-
-# --- Detección tablas/figuras ---
-THIN_MAX = 1.2
-MIN_LINE_LEN = 25.0
-MIN_HLINES = 6
-MIN_VLINES = 4
-MERGE_GAP = 12.0
-MIN_TABLE_AREA = 15_000.0
-MIN_FIG_AREA = 8_000.0
-PNG_DPI = 200
-PNG_DIRNAME = "outputs_png"
-
-# --- Layout ---
-SAME_LINE_Y = 2.5
-SAME_LINE_X_GAP = 22.0
-Y_GAP_MERGE = 6.0
-X_TOL_MERGE = 24.0
-MAX_BISAGRA_TO_Q_GAP = 55.0
-BOTTOM_PAGE_MARGIN = 120.0
-TOP_NEXT_PAGE_SEARCH = 250.0
-
-RE_ROMAN = re.compile(r"^\s*([IVXLCDM]{1,10})\.\s+(.+?)\s*$", re.IGNORECASE)
-RE_QSTART = re.compile(r"^\s*(\d{1,4})\.\s+")
+PDF_PATH = os.getenv("ICSARA_PDF_PATH", "")
+BASE_DIR = os.getenv("ICSARA_BASE_DIR", str(Path("salida_icsara").resolve()))
 
 
-# #############################################################################
-#  GEOMETRÍA
-# #############################################################################
-def rect_area(r):
-    return max(0.0, (r.x1 - r.x0)) * max(0.0, (r.y1 - r.y0))
+# =========================================================
+# OCR OPCIONAL PARA TABLAS DESDE IMAGEN
+# =========================================================
+OCR_TABLES_FROM_IMAGES = True
 
-def union_rect(a, b):
-    return fitz.Rect(min(a.x0, b.x0), min(a.y0, b.y0), max(a.x1, b.x1), max(a.y1, b.y1))
+try:
+    from PIL import Image
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except Exception:
+    TESSERACT_AVAILABLE = False
 
-def intersects(a, b):
-    return a.intersects(b)
 
-def rect_close(a, b, gap):
-    dx = max(0.0, max(a.x0 - b.x1, b.x0 - a.x1))
-    dy = max(0.0, max(a.y0 - b.y1, b.y0 - a.y1))
-    return dx <= gap and dy <= gap
+# =========================================================
+# UTILIDADES GENERALES
+# =========================================================
 
-def merge_rects(rects, gap=MERGE_GAP):
-    rects = [fitz.Rect(r) for r in rects]
-    out = []
-    for r in rects:
-        merged = False
-        for i in range(len(out)):
-            if rect_close(out[i], r, gap):
-                out[i] = union_rect(out[i], r)
-                merged = True
-                break
-        if not merged:
-            out.append(r)
-    changed = True
-    while changed:
-        changed = False
-        new_out = []
-        while out:
-            r = out.pop()
-            merged_any = False
-            for i in range(len(out)):
-                if rect_close(out[i], r, gap):
-                    out[i] = union_rect(out[i], r)
-                    merged_any = True
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def norm(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    return text.strip()
+
+
+def one_line(text: str) -> str:
+    text = norm(text)
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    text = re.sub(r"\n+", " ", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+
+def pdf_stem(pdf_path: str) -> str:
+    return os.path.splitext(os.path.basename(pdf_path))[0]
+
+
+def bbox_union(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+) -> Tuple[float, float, float, float]:
+    return (
+        min(a[0], b[0]),
+        min(a[1], b[1]),
+        max(a[2], b[2]),
+        max(a[3], b[3]),
+    )
+
+
+def rect_area(rect: fitz.Rect) -> float:
+    return max(0.0, float(rect.width)) * max(0.0, float(rect.height))
+
+
+def tuple_to_rect(bbox: Tuple[float, float, float, float]) -> fitz.Rect:
+    return fitz.Rect(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+
+
+def rect_to_tuple(rect: fitz.Rect) -> Tuple[float, float, float, float]:
+    return (float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1))
+
+
+def rect_to_dict(rect: fitz.Rect) -> Dict[str, float]:
+    return {
+        "x0": round(float(rect.x0), 3),
+        "y0": round(float(rect.y0), 3),
+        "x1": round(float(rect.x1), 3),
+        "y1": round(float(rect.y1), 3),
+        "width": round(float(rect.width), 3),
+        "height": round(float(rect.height), 3),
+        "area": round(float(rect_area(rect)), 3),
+    }
+
+
+def union_rect(a: fitz.Rect, b: fitz.Rect) -> fitz.Rect:
+    return fitz.Rect(
+        min(a.x0, b.x0),
+        min(a.y0, b.y0),
+        max(a.x1, b.x1),
+        max(a.y1, b.y1),
+    )
+
+
+def intersection_area_rect(a: fitz.Rect, b: fitz.Rect) -> float:
+    inter = a & b
+    if inter.is_empty:
+        return 0.0
+    return rect_area(inter)
+
+
+def iou_rect(a: fitz.Rect, b: fitz.Rect) -> float:
+    inter = intersection_area_rect(a, b)
+    if inter <= 0:
+        return 0.0
+    union = rect_area(a) + rect_area(b) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def expand_rect(rect: fitz.Rect, pad: float, page_rect: fitz.Rect) -> fitz.Rect:
+    rr = fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad)
+    return rr & page_rect
+
+
+def rects_touch_or_overlap(a: fitz.Rect, b: fitz.Rect, tol: float = 0.0) -> bool:
+    aa = fitz.Rect(a.x0 - tol, a.y0 - tol, a.x1 + tol, a.y1 + tol)
+    bb = fitz.Rect(b.x0 - tol, b.y0 - tol, b.x1 + tol, b.y1 + tol)
+    return not (aa & bb).is_empty
+
+
+def merge_rects(rects: List[fitz.Rect], gap: float = 5.0) -> List[fitz.Rect]:
+    if not rects:
+        return []
+
+    pending = rects[:]
+    merged: List[fitz.Rect] = []
+
+    while pending:
+        current = pending.pop(0)
+        changed = True
+
+        while changed:
+            changed = False
+            keep = []
+            for r in pending:
+                if rects_touch_or_overlap(current, r, tol=gap):
+                    current = union_rect(current, r)
                     changed = True
-                    break
-            if not merged_any:
-                new_out.append(r)
-        out = new_out
-    return out
+                else:
+                    keep.append(r)
+            pending = keep
 
-def in_any_rect(point_y0, rects):
-    """Verifica si una coordenada y0 cae dentro de algún rect."""
-    for r in rects:
-        if r.y0 <= point_y0 <= r.y1:
-            return True
+        merged.append(current)
+
+    return merged
+
+
+def deduplicate_rects(rects: List[fitz.Rect], iou_thr: float = 0.65) -> List[fitz.Rect]:
+    out: List[fitz.Rect] = []
+    for r in sorted(rects, key=lambda z: rect_area(z), reverse=True):
+        if not any(iou_rect(r, k) >= iou_thr for k in out):
+            out.append(r)
+    return sorted(out, key=lambda z: (z.y0, z.x0))
+
+
+def is_inside_header_footer(
+    rect: fitz.Rect,
+    page_rect: fitz.Rect,
+    header_ratio: float = 0.08,
+    footer_ratio: float = 0.08,
+) -> bool:
+    header_limit = page_rect.y0 + page_rect.height * header_ratio
+    footer_limit = page_rect.y1 - page_rect.height * footer_ratio
+    cy = (rect.y0 + rect.y1) / 2.0
+    return cy <= header_limit or cy >= footer_limit
+
+
+def is_footer_or_noise(text: str) -> bool:
+    t = one_line(text)
+    if not t:
+        return True
+    if "Para validar las firmas de este documento" in t:
+        return True
+    if "https://validador.sea.gob.cl/validar/" in t:
+        return True
+    if re.fullmatch(r"\d{2} de [A-Za-zÃ¡Ã©Ã­Ã³ÃºÃ±ÃÃ‰ÃÃ“ÃšÃ‘]+ de \d{4}\.?", t):
+        return True
     return False
 
 
-# #############################################################################
-#  DETECCIÓN TABLAS VECTORIALES Y FIGURAS RASTER
-# #############################################################################
-def extract_table_candidates(page):
+def is_footer_zone(
+    bbox: Tuple[float, float, float, float],
+    page_height: float,
+    threshold: float = 0.9,
+) -> bool:
+    y0 = bbox[1]
+    limit = page_height * threshold
+    return y0 >= limit
+
+
+# =========================================================
+# PATRONES ICSARA
+# =========================================================
+
+RE_OBS = re.compile(r"^\s*((?:\d+\.){3,})\s*(.+?)\s*$")
+RE_SEC2 = re.compile(r"^\s*(\d+\.\d+\.)\s*(.+?)\s*$")
+RE_SEC1 = re.compile(r"^\s*(\d+\.)\s*(.+?)\s*$")
+RE_FIG = re.compile(r"^\s*Figura\s+N[Â°Âº]?\s*\d+", re.IGNORECASE)
+RE_TABLA = re.compile(r"^\s*Tabla(?:\s+N[Â°Âº]?\s*\d+)?", re.IGNORECASE)
+RE_TABLA_STRICT = re.compile(r"^\s*Tabla\s+\S", re.IGNORECASE)
+RE_PREFIX = re.compile(r"^\s*((?:\d+\.){1,10})")
+
+
+def get_prefix(text: str) -> Optional[str]:
+    m = RE_PREFIX.match(text or "")
+    return m.group(1) if m else None
+
+
+def is_observation_prefix(prefix: Optional[str]) -> bool:
+    if not prefix:
+        return False
+    return prefix.count(".") >= 3
+
+
+def detect_requirement_types(text: str) -> List[str]:
+    t = (text or "").lower()
+    t = (
+        t.replace("Ã¡", "a")
+        .replace("Ã©", "e")
+        .replace("Ã­", "i")
+        .replace("Ã³", "o")
+        .replace("Ãº", "u")
+        .replace("Ã±", "n")
+    )
+
+    words = re.findall(r"[a-z]+", t)
+
+    roots = {
+        "solicitar": ["solicit"],
+        "actualizar": ["actualiz"],
+        "aclarar": ["aclar"],
+        "rectificar": ["rectific"],
+        "ampliar": ["ampli"],
+        "informar": ["inform"],
+        "justificar": ["justific"],
+        "presentar": ["present"],
+        "incorporar": ["incorpor"],
+        "complementar": ["complement"],
+        "especificar": ["especific"],
+        "adjuntar": ["adjunt"],
+        "verificar": ["verific"],
+        "evaluar": ["evalu"],
+        "revisar": ["revis"],
+        "mantener": ["manten", "mantuv", "mantend"],
+        "indicar": ["indic"],
+        "senalar": ["senal"],
+        "definir": ["defin"],
+        "describir": ["describ"],
+        "identificar": ["identific"],
+        "corroborar": ["corrobor"],
+        "remitir": ["remit"],
+        "requerir": ["requier", "requer"],
+        "reiterar": ["reiter"],
+        "deber": ["deber", "deba", "debe"],
+    }
+
+    found = []
+    for label, stems in roots.items():
+        if any(any(word.startswith(stem) for stem in stems) for word in words):
+            found.append(label)
+
+    return sorted(set(found))
+
+
+def is_level2_observation_text(text: str) -> bool:
+    return len(detect_requirement_types(text)) > 0
+
+
+# =========================================================
+# EXTRACCIÃ“N DE TEXTO
+# =========================================================
+
+def extract_lines(page: fitz.Page) -> List[Dict[str, Any]]:
+    raw = page.get_text("dict")
+    lines = []
+
+    for block in raw.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+
+            text = "".join(span.get("text", "") for span in spans)
+            text = norm(text)
+            if not text:
+                continue
+
+            x0 = min(s["bbox"][0] for s in spans)
+            y0 = min(s["bbox"][1] for s in spans)
+            x1 = max(s["bbox"][2] for s in spans)
+            y1 = max(s["bbox"][3] for s in spans)
+
+            sizes = [s.get("size", 0) for s in spans if s.get("size")]
+            avg_size = sum(sizes) / len(sizes) if sizes else 0
+
+            lines.append(
+                {
+                    "text": text,
+                    "bbox": (x0, y0, x1, y1),
+                    "x0": x0,
+                    "y0": y0,
+                    "x1": x1,
+                    "y1": y1,
+                    "size": avg_size,
+                }
+            )
+
+    lines.sort(key=lambda r: (round(r["y0"], 1), round(r["x0"], 1)))
+    return lines
+
+
+def compute_typical_gap(lines: List[Dict[str, Any]]) -> float:
+    gaps = []
+    for i in range(1, len(lines)):
+        gap = lines[i]["y0"] - lines[i - 1]["y1"]
+        if 0 <= gap <= 30:
+            gaps.append(gap)
+    if not gaps:
+        return 7.0
+    gaps.sort()
+    return gaps[len(gaps) // 2]
+
+
+def should_break(prev_line: Dict[str, Any], cur_line: Dict[str, Any], typical_gap: float) -> bool:
+    prev_text = prev_line["text"]
+    cur_text = cur_line["text"]
+
+    cur_prefix = get_prefix(cur_text)
+    if cur_prefix:
+        return True
+
+    if RE_FIG.match(cur_text) or RE_TABLA.match(cur_text):
+        return True
+
+    gap = cur_line["y0"] - prev_line["y1"]
+    indent_diff = abs(cur_line["x0"] - prev_line["x0"])
+    size_diff = abs((cur_line.get("size") or 0) - (prev_line.get("size") or 0))
+
+    prev_prefix = get_prefix(prev_text)
+    if prev_prefix and not cur_prefix and gap <= typical_gap * 2.5:
+        return False
+
+    if gap > typical_gap * 2.8:
+        return True
+
+    if indent_diff > 35 and gap > typical_gap * 1.4:
+        return True
+
+    if size_diff > 1.5 and gap > typical_gap * 1.2:
+        return True
+
+    return False
+
+
+def build_block(lines: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not lines:
+        return None
+
+    text = one_line("\n".join(l["text"] for l in lines))
+    if not text or is_footer_or_noise(text):
+        return None
+
+    bbox = lines[0]["bbox"]
+    for l in lines[1:]:
+        bbox = bbox_union(bbox, l["bbox"])
+
+    prefix = get_prefix(text)
+
+    return {
+        "kind": "text",
+        "bbox": bbox,
+        "text": text,
+        "prefix": prefix,
+    }
+
+
+def group_lines(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not lines:
+        return []
+
+    typical_gap = compute_typical_gap(lines)
+    groups = []
+    current = [lines[0]]
+
+    for line in lines[1:]:
+        if should_break(current[-1], line, typical_gap):
+            block = build_block(current)
+            if block:
+                groups.append(block)
+            current = [line]
+        else:
+            current.append(line)
+
+    block = build_block(current)
+    if block:
+        groups.append(block)
+
+    return groups
+
+
+def should_merge_blocks(prev_block: Dict[str, Any], cur_block: Dict[str, Any]) -> bool:
+    if prev_block["kind"] != "text" or cur_block["kind"] != "text":
+        return False
+
+    prev_text = prev_block["text"]
+    cur_text = cur_block["text"]
+
+    cur_prefix = get_prefix(cur_text)
+    if cur_prefix:
+        return False
+
+    if RE_FIG.match(cur_text) or RE_TABLA.match(cur_text):
+        return False
+
+    gap = cur_block["bbox"][1] - prev_block["bbox"][3]
+    left_diff = abs(cur_block["bbox"][0] - prev_block["bbox"][0])
+
+    prev_soft = not re.search(r"[.:;!?]\s*$", prev_text)
+    cur_lower = bool(re.match(r"^[a-zÃ¡Ã©Ã­Ã³ÃºÃ±0-9\(\[]", cur_text))
+
+    prev_prefix = get_prefix(prev_text)
+    if prev_prefix and not cur_prefix and gap <= 18:
+        if cur_lower or gap <= 4:
+            return True
+
+    if gap <= 12 and left_diff <= 35 and (prev_soft or cur_lower):
+        return True
+
+    return False
+
+
+def merge_adjacent_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not blocks:
+        return []
+
+    merged = [blocks[0]]
+    for block in blocks[1:]:
+        prev = merged[-1]
+        if should_merge_blocks(prev, block):
+            prev["text"] = one_line(prev["text"] + " " + block["text"])
+            prev["bbox"] = bbox_union(prev["bbox"], block["bbox"])
+            prev["prefix"] = prev.get("prefix") or block.get("prefix")
+        else:
+            merged.append(block)
+    return merged
+
+
+# =========================================================
+# DETECCIÃ“N DE TABLAS (bbox) â€” sin cambios
+# =========================================================
+
+MIN_LINE_LEN = 18.0
+THIN_MAX = 2.5
+MIN_HLINES = 2
+MIN_VLINES = 2
+MIN_TABLE_AREA = 2500.0
+MIN_TABLE_WIDTH = 80.0
+MIN_TABLE_HEIGHT = 40.0
+MERGE_GAP = 8.0
+LINE_ALIGN_TOL = 2.0
+MIN_TABLE_AREA_FINDER = 1800.0
+MIN_TEXT_CHARS_IN_TABLE = 8
+TABLE_BBOX_PAD = 3.0
+TABLE_DUP_IOU = 0.70
+
+
+def get_text_in_rect(page: fitz.Page, rect: fitz.Rect) -> str:
+    txt = page.get_text("text", clip=rect)
+    return " ".join(txt.split()).strip()
+
+
+def has_enough_text_for_table(page: fitz.Page, rect: fitz.Rect) -> bool:
+    txt = get_text_in_rect(page, rect)
+    return len(txt) >= MIN_TEXT_CHARS_IN_TABLE
+
+
+def normalize_line_rect(r: fitz.Rect) -> fitz.Rect:
+    x0, y0, x1, y1 = r.x0, r.y0, r.x1, r.y1
+
+    if abs(y1 - y0) < 0.5:
+        cy = (y0 + y1) / 2.0
+        return fitz.Rect(x0, cy - 0.5, x1, cy + 0.5)
+
+    if abs(x1 - x0) < 0.5:
+        cx = (x0 + x1) / 2.0
+        return fitz.Rect(cx - 0.5, y0, cx + 0.5, y1)
+
+    return r
+
+
+def _tables_from_vector_drawings(page: fitz.Page) -> List[fitz.Rect]:
     drawings = page.get_drawings()
-    h_lines, v_lines = [], []
+    h_lines: List[fitz.Rect] = []
+    v_lines: List[fitz.Rect] = []
+
+    for d in drawings:
+        for it in d.get("items", []):
+            op = it[0]
+
+            if op == "l":
+                p1, p2 = it[1], it[2]
+                x1, y1 = float(p1.x), float(p1.y)
+                x2, y2 = float(p2.x), float(p2.y)
+                dx, dy = abs(x2 - x1), abs(y2 - y1)
+
+                if dx >= MIN_LINE_LEN and dy <= LINE_ALIGN_TOL:
+                    r = fitz.Rect(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+                    h_lines.append(normalize_line_rect(r))
+
+                elif dy >= MIN_LINE_LEN and dx <= LINE_ALIGN_TOL:
+                    r = fitz.Rect(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+                    v_lines.append(normalize_line_rect(r))
+
+            elif op == "re":
+                r = fitz.Rect(it[1])
+                w, h = abs(r.x1 - r.x0), abs(r.y1 - r.y0)
+
+                if h <= THIN_MAX and w >= MIN_LINE_LEN:
+                    h_lines.append(normalize_line_rect(r))
+                elif w <= THIN_MAX and h >= MIN_LINE_LEN:
+                    v_lines.append(normalize_line_rect(r))
+                elif w >= MIN_TABLE_WIDTH and h >= MIN_TABLE_HEIGHT:
+                    top = fitz.Rect(r.x0, r.y0, r.x1, r.y0 + 1)
+                    bot = fitz.Rect(r.x0, r.y1 - 1, r.x1, r.y1)
+                    lef = fitz.Rect(r.x0, r.y0, r.x0 + 1, r.y1)
+                    rig = fitz.Rect(r.x1 - 1, r.y0, r.x1, r.y1)
+                    h_lines.extend([normalize_line_rect(top), normalize_line_rect(bot)])
+                    v_lines.extend([normalize_line_rect(lef), normalize_line_rect(rig)])
+
+    if len(h_lines) < MIN_HLINES or len(v_lines) < MIN_VLINES:
+        return []
+
+    h_merged = merge_rects(h_lines, gap=2.0)
+    v_merged = merge_rects(v_lines, gap=2.0)
+
+    all_rects = h_merged + v_merged
+    groups = merge_rects(all_rects, gap=MERGE_GAP)
+
+    out = []
+    for g in groups:
+        if g.width < MIN_TABLE_WIDTH or g.height < MIN_TABLE_HEIGHT:
+            continue
+        if rect_area(g) < MIN_TABLE_AREA:
+            continue
+        out.append(g)
+
+    return deduplicate_rects(out, iou_thr=TABLE_DUP_IOU)
+
+
+def _tables_from_pymupdf_find_tables(page: fitz.Page) -> List[fitz.Rect]:
+    rects: List[fitz.Rect] = []
+    finder = getattr(page, "find_tables", None)
+    if not callable(finder):
+        return rects
+
+    try:
+        res = finder()
+    except Exception:
+        return rects
+
+    tables = getattr(res, "tables", None) or []
+    for t in tables:
+        bbox = getattr(t, "bbox", None)
+        if bbox is None:
+            continue
+        r = fitz.Rect(bbox)
+        if rect_area(r) >= MIN_TABLE_AREA_FINDER and r.width >= MIN_TABLE_WIDTH and r.height >= MIN_TABLE_HEIGHT:
+            rects.append(r)
+
+    return deduplicate_rects(rects, iou_thr=TABLE_DUP_IOU)
+
+
+def extract_table_candidates(page: fitz.Page) -> List[Dict[str, Any]]:
+    vec = _tables_from_vector_drawings(page)
+    finder_rects = _tables_from_pymupdf_find_tables(page)
+
+    raw: List[Tuple[fitz.Rect, str]] = []
+    raw.extend((r, "vector") for r in vec)
+    raw.extend((r, "find_tables") for r in finder_rects)
+
+    if not raw:
+        return []
+
+    merged_candidates: List[Dict[str, Any]] = []
+
+    used = [False] * len(raw)
+    for i, (ri, mi) in enumerate(raw):
+        if used[i]:
+            continue
+
+        cluster_rects = [ri]
+        methods = {mi}
+        used[i] = True
+        changed = True
+
+        while changed:
+            changed = False
+            current_union = cluster_rects[0]
+            for rr in cluster_rects[1:]:
+                current_union = union_rect(current_union, rr)
+
+            for j, (rj, mj) in enumerate(raw):
+                if used[j]:
+                    continue
+                if rects_touch_or_overlap(current_union, rj, tol=MERGE_GAP * 2) or iou_rect(current_union, rj) > 0.10:
+                    cluster_rects.append(rj)
+                    methods.add(mj)
+                    used[j] = True
+                    changed = True
+
+        bbox = cluster_rects[0]
+        for rr in cluster_rects[1:]:
+            bbox = union_rect(bbox, rr)
+
+        merged_candidates.append({
+            "bbox": bbox,
+            "methods": sorted(methods),
+        })
+
+    out: List[Dict[str, Any]] = []
+    for item in merged_candidates:
+        r = item["bbox"]
+        if rect_area(r) < MIN_TABLE_AREA_FINDER:
+            continue
+        if r.width < MIN_TABLE_WIDTH or r.height < MIN_TABLE_HEIGHT:
+            continue
+        if is_inside_header_footer(r, page.rect):
+            continue
+        if not has_enough_text_for_table(page, r):
+            continue
+
+        out.append({
+            "bbox": expand_rect(r, TABLE_BBOX_PAD, page.rect),
+            "methods": item["methods"],
+        })
+
+    final_rects = deduplicate_rects([x["bbox"] for x in out], iou_thr=TABLE_DUP_IOU)
+    final_out: List[Dict[str, Any]] = []
+
+    for fr in final_rects:
+        methods = set()
+        for item in out:
+            if iou_rect(fr, item["bbox"]) > 0.60 or rects_touch_or_overlap(fr, item["bbox"], tol=3):
+                methods.update(item["methods"])
+        final_out.append({
+            "bbox": fr,
+            "methods": sorted(methods) if methods else ["unknown"],
+        })
+
+    return final_out
+
+
+def find_table_caption(page_text_blocks: List[Dict[str, Any]], table_rect: fitz.Rect) -> Optional[str]:
+    best = None
+    best_score = 1e9
+
+    for txt in page_text_blocks:
+        t = txt["text"].strip()
+        if not RE_TABLA.match(t):
+            continue
+
+        txt_rect = fitz.Rect(txt["bbox"])
+
+        horizontal_overlap = max(
+            0.0,
+            min(table_rect.x1, txt_rect.x1) - max(table_rect.x0, txt_rect.x0),
+        )
+        min_width = max(1.0, min(table_rect.width, txt_rect.width))
+        overlap_ratio = horizontal_overlap / min_width
+
+        if overlap_ratio < 0.15:
+            continue
+
+        if txt_rect.y0 >= table_rect.y1:
+            dist = txt_rect.y0 - table_rect.y1
+            bias = 20
+        elif table_rect.y0 >= txt_rect.y1:
+            dist = table_rect.y0 - txt_rect.y1
+            bias = 0
+        else:
+            dist = 0
+            bias = 30
+
+        if dist > 120:
+            continue
+
+        score = dist + bias
+        if score < best_score:
+            best = t
+            best_score = score
+
+    return best
+
+
+def save_bbox_screenshot(
+    doc: fitz.Document,
+    page_index0: int,
+    bbox: fitz.Rect,
+    out_dir: str,
+    fname: str,
+    dpi: int = 220,
+) -> str:
+    page = doc[page_index0]
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, clip=bbox, alpha=False)
+
+    ensure_dir(out_dir)
+    out_path = os.path.join(out_dir, fname)
+    pix.save(out_path)
+    return out_path
+
+
+# =========================================================
+# EXTRACCIÃ“N ESTRUCTURADA DE TABLAS â€” MÃ‰TODO 1: pdfplumber
+# =========================================================
+
+def _pdfplumber_extract_table(
+    pdf_path: str,
+    page_index0: int,
+    rect: fitz.Rect,
+) -> Optional[Dict[str, Any]]:
+    """
+    Usa pdfplumber para extraer la estructura de celdas de una tabla.
+    pdfplumber es mucho mejor que PyMuPDF find_tables para tablas con
+    lÃ­neas vectoriales (el caso tÃ­pico de ICSARA/SEIA).
+    """
+    if not PDFPLUMBER_AVAILABLE:
+        return None
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if page_index0 >= len(pdf.pages):
+                return None
+
+            page = pdf.pages[page_index0]
+
+            # Crop al Ã¡rea de la tabla (pdfplumber usa mismas coordenadas PDF)
+            crop_bbox = (
+                float(rect.x0),
+                float(rect.y0),
+                float(rect.x1),
+                float(rect.y1),
+            )
+            cropped = page.crop(crop_bbox)
+
+            # ConfiguraciÃ³n de extracciÃ³n optimizada para ICSARA
+            table_settings = {
+                "vertical_strategy": "lines",
+                "horizontal_strategy": "lines",
+                "snap_tolerance": 5,
+                "join_tolerance": 5,
+                "edge_min_length": 15,
+                "min_words_vertical": 1,
+                "min_words_horizontal": 1,
+                "intersection_tolerance": 8,
+            }
+
+            tables = cropped.extract_tables(table_settings)
+
+            if not tables:
+                # Fallback: probar con estrategia "text" para lÃ­neas
+                table_settings["vertical_strategy"] = "lines_strict"
+                table_settings["horizontal_strategy"] = "lines_strict"
+                tables = cropped.extract_tables(table_settings)
+
+            if not tables:
+                # Ãšltimo fallback: estrategia mixta
+                table_settings["vertical_strategy"] = "text"
+                table_settings["horizontal_strategy"] = "lines"
+                tables = cropped.extract_tables(table_settings)
+
+            if not tables:
+                return None
+
+            # Tomar la tabla mÃ¡s grande (mÃ¡s celdas)
+            best_table = max(tables, key=lambda t: len(t) * len(t[0]) if t and t[0] else 0)
+
+            if not best_table or len(best_table) < 1:
+                return None
+
+            # Limpiar celdas
+            cleaned_rows = []
+            max_cols = 0
+
+            for row in best_table:
+                cleaned_row = []
+                for cell in row:
+                    if cell is None or str(cell).strip() == "":
+                        cleaned_row.append(None)
+                    else:
+                        cell_text = " ".join(str(cell).split())
+                        cleaned_row.append(cell_text if cell_text else None)
+                cleaned_rows.append(cleaned_row)
+                max_cols = max(max_cols, len(cleaned_row))
+
+            if max_cols == 0:
+                return None
+
+            return {
+                "rows": cleaned_rows,
+                "num_rows": len(cleaned_rows),
+                "num_cols": max_cols,
+                "method": "pdfplumber",
+            }
+
+    except Exception as e:
+        # Debug: descomentar para ver errores
+        # print(f"  [pdfplumber error] page {page_index0+1}: {e}")
+        return None
+
+
+# =========================================================
+# EXTRACCIÃ“N ESTRUCTURADA DE TABLAS â€” MÃ‰TODO 2: PyMuPDF
+# =========================================================
+
+def _pymupdf_extract_table(
+    page: fitz.Page,
+    rect: fitz.Rect,
+) -> Optional[Dict[str, Any]]:
+    """
+    Usa PyMuPDF find_tables().extract() â€” mÃ©todo original.
+    """
+    finder = getattr(page, "find_tables", None)
+    if not callable(finder):
+        return None
+
+    try:
+        res = finder()
+    except Exception:
+        return None
+
+    tables = getattr(res, "tables", None) or []
+
+    best_table = None
+    best_iou = 0.0
+    for t in tables:
+        bbox = getattr(t, "bbox", None)
+        if bbox is None:
+            continue
+        t_rect = fitz.Rect(bbox)
+        score = iou_rect(rect, t_rect)
+        if score > best_iou:
+            best_iou = score
+            best_table = t
+
+    if best_table is None or best_iou < 0.25:
+        return None
+
+    try:
+        raw_rows = best_table.extract()
+    except Exception:
+        return None
+
+    if not raw_rows:
+        return None
+
+    cleaned_rows = []
+    max_cols = 0
+
+    for row in raw_rows:
+        cleaned_row = []
+        for cell in row:
+            if cell is None:
+                cleaned_row.append(None)
+            else:
+                cell_text = " ".join(str(cell).split())
+                cleaned_row.append(cell_text if cell_text else None)
+        cleaned_rows.append(cleaned_row)
+        max_cols = max(max_cols, len(cleaned_row))
+
+    return {
+        "rows": cleaned_rows,
+        "num_rows": len(cleaned_rows),
+        "num_cols": max_cols,
+        "method": "pymupdf_find_tables",
+    }
+
+
+# =========================================================
+# EXTRACCIÃ“N ESTRUCTURADA DE TABLAS â€” MÃ‰TODO 3: HeurÃ­stico
+# Reconstruye filas/columnas a partir de lÃ­neas vectoriales
+# y texto con coordenadas (dict blocks).
+# =========================================================
+
+def _heuristic_extract_table(
+    page: fitz.Page,
+    rect: fitz.Rect,
+) -> Optional[Dict[str, Any]]:
+    """
+    MÃ©todo heurÃ­stico: detecta las lÃ­neas horizontales y verticales dentro
+    del bbox de la tabla para determinar la grilla de celdas, luego asigna
+    el texto de cada span a la celda correspondiente.
+    """
+    # 1. Recolectar lÃ­neas H y V dentro del rect
+    drawings = page.get_drawings()
+    h_ys: List[float] = []
+    v_xs: List[float] = []
+
+    pad = 3.0
+    clip = fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad)
+
     for d in drawings:
         for it in d.get("items", []):
             op = it[0]
             if op == "l":
-                (x1, y1), (x2, y2) = it[1], it[2]
-                dx, dy = abs(x2 - x1), abs(y2 - y1)
-                if dx >= MIN_LINE_LEN and dy <= 1.0:
-                    h_lines.append(fitz.Rect(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)))
-                elif dy >= MIN_LINE_LEN and dx <= 1.0:
-                    v_lines.append(fitz.Rect(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)))
+                p1, p2 = it[1], it[2]
+                x1f, y1f = float(p1.x), float(p1.y)
+                x2f, y2f = float(p2.x), float(p2.y)
+                mid_r = fitz.Rect(
+                    min(x1f, x2f), min(y1f, y2f),
+                    max(x1f, x2f), max(y1f, y2f),
+                )
+                if not rects_touch_or_overlap(mid_r, clip, tol=2):
+                    continue
+
+                dx, dy = abs(x2f - x1f), abs(y2f - y1f)
+                if dx >= 15 and dy <= 3:
+                    h_ys.append((y1f + y2f) / 2.0)
+                elif dy >= 15 and dx <= 3:
+                    v_xs.append((x1f + x2f) / 2.0)
+
             elif op == "re":
                 r = fitz.Rect(it[1])
-                w, h = abs(r.x1 - r.x0), abs(r.y1 - r.y0)
-                if h <= THIN_MAX and w >= MIN_LINE_LEN:
-                    h_lines.append(r)
-                elif w <= THIN_MAX and h >= MIN_LINE_LEN:
-                    v_lines.append(r)
-    if len(h_lines) < MIN_HLINES or len(v_lines) < MIN_VLINES:
-        return []
-    all_rects = h_lines + v_lines
-    bbox = all_rects[0]
-    for r in all_rects[1:]:
-        bbox = union_rect(bbox, r)
-    if rect_area(bbox) < MIN_TABLE_AREA:
-        return []
-    merged = merge_rects(all_rects, gap=MERGE_GAP)
-    groups = merge_rects(merged, gap=MERGE_GAP * 2)
-    return [g for g in groups if rect_area(g) >= MIN_TABLE_AREA]
+                if not rects_touch_or_overlap(r, clip, tol=2):
+                    continue
+                w, h = r.width, r.height
+                if h <= 3 and w >= 15:
+                    h_ys.append((r.y0 + r.y1) / 2.0)
+                elif w <= 3 and h >= 15:
+                    v_xs.append((r.x0 + r.x1) / 2.0)
+                elif w >= 30 and h >= 20:
+                    h_ys.extend([r.y0, r.y1])
+                    v_xs.extend([r.x0, r.x1])
 
+    # TambiÃ©n considerar los bordes del rect como lÃ­neas
+    h_ys.extend([rect.y0, rect.y1])
+    v_xs.extend([rect.x0, rect.x1])
 
-def extract_raster_figures(page):
-    figs = []
-    for img in page.get_images(full=True):
-        xref = img[0]
-        for r in page.get_image_rects(xref):
-            rr = fitz.Rect(r)
-            if rect_area(rr) >= MIN_FIG_AREA:
-                figs.append(rr)
-    return merge_rects(figs, gap=10.0)
+    # Deduplicar con tolerancia
+    def dedup_coords(coords: List[float], tol: float = 4.0) -> List[float]:
+        if not coords:
+            return []
+        coords = sorted(set(coords))
+        result = [coords[0]]
+        for c in coords[1:]:
+            if c - result[-1] > tol:
+                result.append(c)
+            else:
+                result[-1] = (result[-1] + c) / 2.0
+        return result
 
+    h_ys = dedup_coords(h_ys, tol=4.0)
+    v_xs = dedup_coords(v_xs, tol=4.0)
 
-def save_bbox_screenshot(doc, page_index0, bbox, out_dir, fname, dpi=PNG_DPI):
-    page = doc[page_index0]
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, clip=fitz.Rect(bbox), alpha=False)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / fname
-    pix.save(out_path.as_posix())
-    return out_path.as_posix()
+    if len(h_ys) < 2 or len(v_xs) < 2:
+        return None
 
+    num_rows = len(h_ys) - 1
+    num_cols = len(v_xs) - 1
 
-# #############################################################################
-#  TEXTO PLANO — EXCLUYENDO ZONAS DE TABLAS/FIGURAS
-# #############################################################################
-def extract_page_text_excluding_bboxes(page, exclude_rects):
-    """
-    Extrae texto de la página excluyendo las zonas de tablas/figuras.
-    Usa page.get_text("dict") y filtra bloques/líneas cuyos spans
-    caigan dentro de algún rect excluido.
-    """
-    d = page.get_text("dict")
-    out_lines = []
+    if num_rows < 1 or num_cols < 1:
+        return None
 
-    for block in d.get("blocks", []):
+    # 2. Crear grilla de celdas vacÃ­as
+    grid: List[List[List[str]]] = [[[] for _ in range(num_cols)] for _ in range(num_rows)]
+
+    # 3. Extraer words/spans con coordenadas y asignar a celdas
+    raw_dict = page.get_text("dict", clip=rect)
+    for block in raw_dict.get("blocks", []):
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
-            line_bbox = fitz.Rect(line["bbox"])
-            # Si la línea intersecta con algún rect excluido, omitirla
-            skip = False
-            for er in exclude_rects:
-                if intersects(line_bbox, er):
-                    skip = True
-                    break
-            if skip:
-                continue
-            # Reconstruir texto de la línea
-            text = "".join(sp.get("text", "") for sp in line.get("spans", []))
-            out_lines.append(text)
+            for span in line.get("spans", []):
+                txt = (span.get("text", "") or "").strip()
+                if not txt:
+                    continue
+                sx0 = span["bbox"][0]
+                sy0 = span["bbox"][1]
+                sx1 = span["bbox"][2]
+                sy1 = span["bbox"][3]
+                cx = (sx0 + sx1) / 2.0
+                cy = (sy0 + sy1) / 2.0
 
-    return "\n".join(out_lines)
+                # Encontrar fila
+                row_idx = None
+                for ri in range(num_rows):
+                    if h_ys[ri] - 2 <= cy <= h_ys[ri + 1] + 2:
+                        row_idx = ri
+                        break
+                if row_idx is None:
+                    # Buscar la fila mÃ¡s cercana
+                    best_ri = 0
+                    best_dist = abs(cy - (h_ys[0] + h_ys[1]) / 2.0)
+                    for ri in range(num_rows):
+                        mid = (h_ys[ri] + h_ys[ri + 1]) / 2.0
+                        d = abs(cy - mid)
+                        if d < best_dist:
+                            best_dist = d
+                            best_ri = ri
+                    row_idx = best_ri
 
+                # Encontrar columna
+                col_idx = None
+                for ci in range(num_cols):
+                    if v_xs[ci] - 2 <= cx <= v_xs[ci + 1] + 2:
+                        col_idx = ci
+                        break
+                if col_idx is None:
+                    best_ci = 0
+                    best_dist = abs(cx - (v_xs[0] + v_xs[1]) / 2.0)
+                    for ci in range(num_cols):
+                        mid = (v_xs[ci] + v_xs[ci + 1]) / 2.0
+                        d = abs(cx - mid)
+                        if d < best_dist:
+                            best_dist = d
+                            best_ci = ci
+                    col_idx = best_ci
 
-def normalize_lines_keep_empty(text):
-    return [ln.rstrip("\r") for ln in text.replace("\x0c", "\n").split("\n")]
+                if 0 <= row_idx < num_rows and 0 <= col_idx < num_cols:
+                    grid[row_idx][col_idx].append(txt)
 
-
-# #############################################################################
-#  FILTRO HEADERS/FOOTERS + STITCH
-# #############################################################################
-def build_frequent_line_filter(pages_lines, min_ratio=MIN_RATIO_FRECUENTES):
-    n = len(pages_lines)
-    c = Counter()
-    for lines in pages_lines:
-        for ln in set(ln.strip() for ln in lines if ln.strip()):
-            c[ln] += 1
-    threshold = max(2, int(n * min_ratio))
-    return {ln for ln, k in c.items() if k >= threshold}
-
-
-def clean_page_lines_keep_empty(lines, frequent_lines):
-    out = []
-    for ln in lines:
-        s = ln.strip()
-        if s == "":
-            out.append("")
-            continue
-        if s in frequent_lines:
-            continue
-        low = s.lower()
-        if any(fr.lower() in low for fr in FRASES_RUIDO):
-            continue
-        if re.fullmatch(r"\d{1,4}", s):
-            continue
-        out.append(s)
-    return out
-
-
-def stitch_pages(pages_clean_lines):
-    texto = ""
-    for lines in pages_clean_lines:
-        page_text = "\n".join(lines).strip()
-        if not page_text:
-            continue
-        if not texto:
-            texto = page_text
-            continue
-        prev = texto.rstrip()
-        if prev.endswith("-"):
-            texto = prev[:-1] + page_text.lstrip()
-        else:
-            texto += "\n" + page_text.lstrip()
-    return texto
-
-
-# #############################################################################
-#  NORMALIZACIÓN Y FORMATEO DE TEXTO
-# #############################################################################
-def normalize_text_preserving_paragraphs(text):
-    text = re.sub(r"-\n(?=\w)", "", text)
-    text = re.sub(r"\n\s*\n+", "\n<<<PARA>>>\n", text)
-    list_start = r"(?:[A-Za-z]\)|\d+\)|\([A-Za-z0-9]+\)|[-•])"
-    text = re.sub(rf"\n\s*(?={list_start})", "\n<<<PARA>>>\n", text)
-    text = re.sub(r"\n+", " ", text)
-    text = text.replace("<<<PARA>>>", "\n")
-    text = re.sub(r"[ \t]{2,}", " ", text).strip()
-    return text
-
-
-def looks_table_row_horizontal(line):
-    if re.search(r"\s{2,}", line.strip()):
-        cols = [c for c in re.split(r"\s{2,}", line.strip()) if c.strip()]
-        return len(cols) >= 2
-    return False
-
-
-def split_table_row_horizontal(line):
-    return [re.sub(r"\s{2,}", " ", c.strip()) for c in re.split(r"\s{2,}", line.strip()) if c.strip()]
-
-
-def format_horizontal_table_as_semicolon(lines):
-    rows = [split_table_row_horizontal(ln) for ln in lines if ln.strip()]
-    if not rows:
-        return ""
-    mx = max(len(r) for r in rows)
-    rows = [r + [""] * (mx - len(r)) for r in rows]
-    return "\n".join(";".join(r) for r in rows)
-
-
-def parse_tabla_partes_obras(lines, start_idx):
-    i = start_idx
-    if i >= len(lines) or not RE_TABLA_PARTES.match(lines[i].strip()):
-        return "", start_idx
-    table_title = lines[i].strip()
-    i += 1
-    while i < len(lines) and not RE_NOMBRE_PARTE.match(lines[i].strip()):
-        i += 1
+    # 4. Convertir grilla a rows
     rows = []
-    header = ["Tabla", "Nombre", "Descripción", "Carácter", "Fase"]
-    while i < len(lines):
-        if RE_TABLA_PARTES.match(lines[i].strip()):
-            i += 1
-            while i < len(lines) and not RE_NOMBRE_PARTE.match(lines[i].strip()):
-                i += 1
-            continue
-        m_name = RE_NOMBRE_PARTE.match(lines[i].strip())
-        if not m_name:
-            break
-        nombre = f"[{m_name.group(1)}]"
-        i += 1
-        desc_lines = []
-        while i < len(lines) and not RE_CARACTER.match(lines[i].strip()):
-            if RE_NOMBRE_PARTE.match(lines[i].strip()):
-                break
-            desc_lines.append(lines[i])
-            i += 1
-        descripcion = normalize_text_preserving_paragraphs("\n".join(desc_lines)).strip()
-        caracter = ""
-        if i < len(lines) and RE_CARACTER.match(lines[i].strip()):
-            caracter = "Temporal o permanente"
-            i += 1
-        fase = ""
-        if i < len(lines):
-            m_f = RE_FASE.match(lines[i].strip())
-            if m_f:
-                fase = m_f.group(1)
-                i += 1
-            elif lines[i].strip().startswith("[") and lines[i].strip().endswith("]"):
-                fase = lines[i].strip().strip("[]").strip()
-                i += 1
-        rows.append([table_title, nombre, descripcion, caracter, fase])
-        while i < len(lines) and lines[i].strip() == "":
-            i += 1
-        if i < len(lines) and RE_NUM_SOLO.match(lines[i]):
-            break
-    if not rows:
-        return "", start_idx
-    out_lines = [";".join(header)]
-    for r in rows:
-        out_lines.append(";".join(r))
-    return "\n".join(out_lines), i
-
-
-def format_question(texto_raw):
-    lines = normalize_lines_keep_empty(texto_raw)
-    out_parts = []
-    buf_text = []
-
-    def flush_text():
-        nonlocal buf_text
-        if not buf_text:
-            return
-        block = "\n".join(buf_text).strip()
-        if block:
-            out_parts.append(normalize_text_preserving_paragraphs(block))
-        buf_text = []
-
-    i = 0
-    while i < len(lines):
-        ln = lines[i]
-        if ln.strip() == "":
-            buf_text.append("")
-            i += 1
-            continue
-        if RE_TABLA_PARTES.match(ln.strip()):
-            flush_text()
-            table_csv, new_i = parse_tabla_partes_obras(lines, i)
-            if table_csv:
-                out_parts.append(table_csv)
-                i = new_i
-                continue
-        if looks_table_row_horizontal(ln):
-            flush_text()
-            table_lines = []
-            while i < len(lines) and lines[i].strip() != "" and looks_table_row_horizontal(lines[i]):
-                table_lines.append(lines[i])
-                i += 1
-            table_txt = format_horizontal_table_as_semicolon(table_lines)
-            if table_txt:
-                out_parts.append(table_txt)
-            continue
-        buf_text.append(ln)
-        i += 1
-    flush_text()
-    return "\n".join(p for p in out_parts if p).strip()
-
-
-# #############################################################################
-#  LIMPIEZA POST-FORMATO
-# #############################################################################
-def clean_firma_digital(texto):
-    texto = RE_FIRMA_BLOQUE.sub("", texto)
-    texto = RE_FIRMA_COMPLETA.sub("", texto)
-    texto = texto.rstrip()
-    m = RE_FECHA_PRE_FIRMA.search(texto)
-    if m:
-        pos = m.start()
-        remaining = RE_FECHA_PRE_FIRMA.sub("", texto[pos:]).strip()
-        if not remaining:
-            texto = texto[:pos].rstrip()
-    return re.sub(r"[\s\n]+$", "", texto)
-
-
-def clean_trailing_hinge(texto, all_hinge_texts):
-    if not all_hinge_texts:
-        return texto
-    ts = texto.rstrip()
-    for ht in all_hinge_texts:
-        ht = ht.strip()
-        if not ht:
-            continue
-        if ts.endswith(ht):
-            ts = ts[:-len(ht)].rstrip()
-            break
-        if ht.endswith(".") and ts.endswith(ht[:-1]):
-            ts = ts[:-(len(ht) - 1)].rstrip()
-            break
-    return re.sub(r"[\s\n]+$", "", ts)
-
-
-# #############################################################################
-#  PREGUNTAS — DETECCIÓN DESDE TEXTO PLANO
-# #############################################################################
-def get_line_bounds(text, pos):
-    ls = text.rfind("\n", 0, pos) + 1
-    le = text.find("\n", pos)
-    return ls, (le if le != -1 else len(text))
-
-
-def next_nonempty_line(text, start_pos):
-    i = start_pos
-    n = len(text)
-    while i < n:
-        j = text.find("\n", i)
-        if j == -1:
-            return text[i:].strip()
-        line = text[i:j].strip()
-        if line:
-            return line
-        i = j + 1
-    return ""
-
-
-def is_false_question_start(texto_total, match_start, num_str):
-    ls, le = get_line_bounds(texto_total, match_start)
-    line = texto_total[ls:le].strip()
-    low = line.lower()
-    if len(num_str) == 4:
-        try:
-            n = int(num_str)
-            if YEAR_MIN <= n <= YEAR_MAX and any(t in low for t in FIRMA_TOKENS):
-                return True
-        except: pass
-    only_num = bool(re.fullmatch(r"\s*" + re.escape(num_str) + r"\.\s*", line))
-    if not only_num:
-        return False
-    if len(num_str) == 4:
-        try:
-            n = int(num_str)
-            if YEAR_MIN <= n <= YEAR_MAX:
-                return True
-        except: pass
-    if len(num_str) >= 2 and num_str[0] == "0":
-        return True
-    nxt = next_nonempty_line(texto_total, le + 1)
-    if nxt and not re.match(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", nxt[0]):
-        return True
-    return False
-
-
-def apply_monotonic_filter(starts):
-    kept = []
-    last_num = None
-    for ini, num in starts:
-        try: n = int(num)
-        except: continue
-        if last_num is None:
-            kept.append((ini, num)); last_num = n; continue
-        if n < last_num and (last_num - n) >= MONO_DROP_THRESHOLD:
-            continue
-        kept.append((ini, num)); last_num = n
-    return kept
-
-
-def extract_questions_from_text(texto_total):
-    matches = list(PAT_PREGUNTA.finditer(texto_total))
-    starts = []
-    for m in matches:
-        ini, num = m.start(), m.group(1)
-        if not is_false_question_start(texto_total, ini, num):
-            starts.append((ini, num))
-    starts = apply_monotonic_filter(starts)
-    out = []
-    for i, (ini, num) in enumerate(starts):
-        fin = starts[i + 1][0] if i + 1 < len(starts) else len(texto_total)
-        raw_sin = re.sub(rf"^\s*{re.escape(num)}\.\s*", "", texto_total[ini:fin].strip(), count=1)
-        out.append({"numero": int(num), "texto": format_question(raw_sin)})
-    return out
-
-
-# #############################################################################
-#  LAYOUT — CAPÍTULOS Y BISAGRAS
-# #############################################################################
-def extract_spans(page):
-    d = page.get_text("dict")
-    spans = []
-    for block in d.get("blocks", []):
-        if block.get("type") != 0: continue
-        for line in block.get("lines", []):
-            for sp in line.get("spans", []):
-                txt = (sp.get("text") or "").strip()
-                if not txt: continue
-                bbox = fitz.Rect(sp["bbox"])
-                flags = int(sp.get("flags", 0))
-                font = (sp.get("font") or "").lower()
-                is_bold = ("bold" in font) or (flags & 16)
-                spans.append({"text": txt, "bbox": bbox, "is_bold": bool(is_bold)})
-    return spans
-
-
-def build_lines_from_spans(spans):
-    spans = sorted(spans, key=lambda s: (round(s["bbox"].y0, 1), s["bbox"].x0))
-    lines = []
-    for sp in spans:
-        r = sp["bbox"]
-        placed = False
-        for ln in lines:
-            if abs(ln["_y0"] - r.y0) <= SAME_LINE_Y:
-                ln["spans"].append(sp)
-                ln["_y0"] = (ln["_y0"] + r.y0) / 2.0
-                ln["_bbox"] = union_rect(ln["_bbox"], r)
-                placed = True; break
-        if not placed:
-            lines.append({"_y0": r.y0, "_bbox": fitz.Rect(r), "spans": [sp]})
-    out = []
-    for ln in lines:
-        sps = sorted(ln["spans"], key=lambda s: s["bbox"].x0)
-        parts = []; prev = None
-        for sp in sps:
-            if prev is None:
-                parts.append(sp["text"])
+    for ri in range(num_rows):
+        row = []
+        for ci in range(num_cols):
+            cell_parts = grid[ri][ci]
+            if cell_parts:
+                cell_text = " ".join(cell_parts)
+                cell_text = re.sub(r"\s{2,}", " ", cell_text).strip()
+                row.append(cell_text if cell_text else None)
             else:
-                gap = sp["bbox"].x0 - prev["bbox"].x1
-                if gap > SAME_LINE_X_GAP:
-                    parts.append(" " + sp["text"])
-                elif parts and not parts[-1].endswith((" ", "-", "\u201c", "\"", "(", "/")) \
-                     and not sp["text"].startswith((",", ".", ")", ":", ";")):
-                    parts.append(" " + sp["text"])
-                else:
-                    parts.append(sp["text"])
-            prev = sp
-        text = "".join(parts).strip()
-        bold_count = sum(1 for sp in sps if sp["is_bold"])
-        out.append({"text": text, "bbox": ln["_bbox"], "spans": sps,
-                     "is_bold_line": bold_count / max(1, len(sps)) >= 0.6})
-    out.sort(key=lambda x: (x["bbox"].y0, x["bbox"].x0))
-    return out
+                row.append(None)
+        rows.append(row)
+
+    # Validar: al menos alguna celda con contenido
+    has_content = any(
+        any(cell is not None for cell in row)
+        for row in rows
+    )
+    if not has_content:
+        return None
+
+    return {
+        "rows": rows,
+        "num_rows": num_rows,
+        "num_cols": num_cols,
+        "method": "heuristic_grid",
+    }
 
 
-def merge_bold_lines(bold_lines):
-    if not bold_lines: return []
-    bold_lines = sorted(bold_lines, key=lambda x: (x["bbox"].y0, x["bbox"].x0))
-    merged = []; cur = None
-    for ln in bold_lines:
-        if cur is None:
-            cur = {"text": ln["text"], "bbox": fitz.Rect(ln["bbox"])}; continue
-        dy = ln["bbox"].y0 - cur["bbox"].y1
-        same = abs(ln["bbox"].y0 - cur["bbox"].y0) <= SAME_LINE_Y and ln["bbox"].x0 >= cur["bbox"].x0
-        nxt = (0.0 <= dy <= Y_GAP_MERGE) and abs(ln["bbox"].x0 - cur["bbox"].x0) <= X_TOL_MERGE
-        if same or nxt:
-            cur["text"] = (cur["text"] + " " + ln["text"]).strip()
-            cur["bbox"] = union_rect(cur["bbox"], ln["bbox"])
+# =========================================================
+# FUNCIONES AUXILIARES OCR (Tesseract)
+# =========================================================
+
+def _safe_int(v, default: int = 0) -> int:
+    try:
+        return int(float(v))
+    except Exception:
+        return default
+
+
+def ocr_words_from_image(image_path: str) -> List[Dict[str, Any]]:
+    """Extrae palabras con coordenadas desde una imagen usando Tesseract."""
+    if not OCR_TABLES_FROM_IMAGES or not TESSERACT_AVAILABLE:
+        return []
+
+    try:
+        img = Image.open(image_path)
+        data = pytesseract.image_to_data(
+            img,
+            lang="spa+eng",
+            output_type=pytesseract.Output.DICT,
+            config="--psm 6"
+        )
+    except Exception:
+        return []
+
+    words = []
+    n = len(data.get("text", []))
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        conf_raw = data.get("conf", [])[i] if i < len(data.get("conf", [])) else -1
+        try:
+            conf = float(conf_raw)
+        except Exception:
+            conf = -1.0
+
+        if not txt:
+            continue
+        if conf < 0:
+            continue
+
+        x = _safe_int(data["left"][i])
+        y = _safe_int(data["top"][i])
+        w = _safe_int(data["width"][i])
+        h = _safe_int(data["height"][i])
+
+        words.append({
+            "text": txt,
+            "x0": x,
+            "y0": y,
+            "x1": x + w,
+            "y1": y + h,
+            "width": w,
+            "height": h,
+            "conf": conf,
+        })
+
+    return words
+
+
+def group_words_into_rows(words: List[Dict[str, Any]], y_tol: int = 12) -> List[List[Dict[str, Any]]]:
+    """Agrupa palabras OCR en filas por proximidad vertical."""
+    if not words:
+        return []
+
+    words = sorted(words, key=lambda w: (w["y0"], w["x0"]))
+    rows: List[List[Dict[str, Any]]] = []
+
+    for w in words:
+        placed = False
+        cy = (w["y0"] + w["y1"]) / 2.0
+
+        for row in rows:
+            row_centers = [((r["y0"] + r["y1"]) / 2.0) for r in row]
+            row_center = sum(row_centers) / len(row_centers)
+            if abs(cy - row_center) <= y_tol:
+                row.append(w)
+                placed = True
+                break
+
+        if not placed:
+            rows.append([w])
+
+    for row in rows:
+        row.sort(key=lambda w: w["x0"])
+
+    rows.sort(key=lambda row: min(w["y0"] for w in row))
+    return rows
+
+
+def infer_column_gaps(rows: List[List[Dict[str, Any]]], min_gap: int = 25) -> List[int]:
+    """Detecta separadores de columna por gaps horizontales entre palabras."""
+    gaps = []
+
+    for row in rows:
+        if len(row) < 2:
+            continue
+        for i in range(1, len(row)):
+            gap = row[i]["x0"] - row[i - 1]["x1"]
+            if gap >= min_gap:
+                split_x = int((row[i]["x0"] + row[i - 1]["x1"]) / 2.0)
+                gaps.append(split_x)
+
+    if not gaps:
+        return []
+
+    gaps.sort()
+    merged = [gaps[0]]
+
+    for g in gaps[1:]:
+        if abs(g - merged[-1]) <= 20:
+            merged[-1] = int((merged[-1] + g) / 2.0)
         else:
-            merged.append(cur); cur = {"text": ln["text"], "bbox": fitz.Rect(ln["bbox"])}
-    if cur: merged.append(cur)
-    for m in merged: m["text"] = re.sub(r"\s{2,}", " ", m["text"]).strip()
+            merged.append(g)
+
     return merged
 
 
-def detect_qstarts_layout(lines, exclude_rects, page_no):
-    q = []
-    for ln in lines:
-        skip = False
-        for er in exclude_rects:
-            if intersects(ln["bbox"], er):
-                skip = True; break
-        if skip: continue
-        m = RE_QSTART.match(ln["text"])
-        if m:
-            q.append({"num": int(m.group(1)), "bbox": ln["bbox"], "text": ln["text"]})
-    q.sort(key=lambda x: (x["bbox"].y0, x["bbox"].x0))
-    return q
+def assign_word_to_column(word: Dict[str, Any], col_splits: List[int]) -> int:
+    """Asigna una palabra a su columna segÃºn los separadores detectados."""
+    cx = (word["x0"] + word["x1"]) / 2.0
+    col = 0
+    for split_x in col_splits:
+        if cx > split_x:
+            col += 1
+    return col
 
 
-def classify_bolds(merged_bolds, qstarts, exclude_rects, page_no, page_height, next_qstarts=None):
-    chapters, hinges = [], []
-    for b in merged_bolds:
-        skip = False
-        for er in exclude_rects:
-            if intersects(b["bbox"], er):
-                skip = True; break
-        if skip: continue
-        txt = b["text"].strip()
-        if RE_ROMAN.match(txt):
-            chapters.append({"type": "chapter", "page": page_no, "text": txt,
-                             "bbox": [b["bbox"].x0, b["bbox"].y0, b["bbox"].x1, b["bbox"].y1],
-                             "sort_key": (page_no, b["bbox"].y0)})
-            continue
-        b_bottom = b["bbox"].y1
-        cand = None
-        for qs in qstarts:
-            if qs["bbox"].y0 < b_bottom: continue
-            gap = qs["bbox"].y0 - b_bottom
-            if gap <= MAX_BISAGRA_TO_Q_GAP: cand = qs; break
-            if gap > MAX_BISAGRA_TO_Q_GAP: break
-        if cand is None and next_qstarts and (page_height - b_bottom) <= BOTTOM_PAGE_MARGIN:
-            for qs in next_qstarts:
-                if qs["bbox"].y0 <= TOP_NEXT_PAGE_SEARCH: cand = qs; break
-        if cand is not None:
-            hinges.append({"type": "hinge", "page": page_no, "text": txt,
-                           "bbox": [b["bbox"].x0, b["bbox"].y0, b["bbox"].x1, b["bbox"].y1],
-                           "sort_key": (page_no, b["bbox"].y0)})
-    return chapters, hinges
+# =========================================================
+# EXTRACCIÃ“N ESTRUCTURADA â€” MÃ‰TODO 4: OCR desde screenshot
+# Digitaliza la imagen PNG generada del recorte de la tabla.
+# =========================================================
+
+def _ocr_extract_table(image_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    """
+    Usa Tesseract OCR sobre el screenshot PNG de la tabla para
+    reconstruir filas y columnas a partir de las coordenadas de
+    cada palabra detectada.
+    """
+    if not image_path or not os.path.isfile(image_path):
+        return None
+
+    if not TESSERACT_AVAILABLE:
+        return None
+
+    # 1. OCR: obtener palabras con coordenadas
+    words = ocr_words_from_image(image_path)
+    if not words:
+        return None
+
+    # 2. Agrupar palabras en filas por proximidad vertical
+    rows_of_words = group_words_into_rows(words, y_tol=12)
+    if not rows_of_words:
+        return None
+
+    # 3. Inferir separadores de columna por gaps horizontales
+    col_splits = infer_column_gaps(rows_of_words, min_gap=25)
+
+    # 4. Construir matriz de celdas
+    result_rows: List[List[Optional[str]]] = []
+    max_cols = 0
+
+    for row in rows_of_words:
+        cols: Dict[int, List[str]] = defaultdict(list)
+
+        for w in row:
+            col_idx = assign_word_to_column(w, col_splits)
+            cols[col_idx].append(w["text"])
+
+        max_col = max(cols.keys()) if cols else -1
+        row_cells: List[Optional[str]] = []
+
+        for c in range(max_col + 1):
+            cell_text = " ".join(cols.get(c, []))
+            cell_text = re.sub(r"\s{2,}", " ", cell_text).strip()
+            row_cells.append(cell_text if cell_text else None)
+
+        # Quitar celdas vacÃ­as del final
+        while row_cells and row_cells[-1] is None:
+            row_cells.pop()
+
+        if row_cells:
+            result_rows.append(row_cells)
+            max_cols = max(max_cols, len(row_cells))
+
+    if not result_rows or max_cols == 0:
+        return None
+
+    # Normalizar: todas las filas con mismo nÃºmero de columnas
+    for i in range(len(result_rows)):
+        while len(result_rows[i]) < max_cols:
+            result_rows[i].append(None)
+
+    # Validar que hay contenido real
+    has_content = any(
+        any(cell is not None for cell in row)
+        for row in result_rows
+    )
+    if not has_content:
+        return None
+
+    return {
+        "rows": result_rows,
+        "num_rows": len(result_rows),
+        "num_cols": max_cols,
+        "method": "ocr_screenshot",
+    }
 
 
-def filter_questions_by_continuity(all_qs):
-    if not all_qs: return []
-    sorted_qs = sorted(all_qs, key=lambda q: q["sort_key"])
-    filtered = []; last = -1
-    for q in sorted_qs:
-        if last < 0 or q["num"] >= last:
-            filtered.append(q); last = q["num"]
-    return filtered
+# =========================================================
+# FUNCIÃ“N PRINCIPAL DE EXTRACCIÃ“N ESTRUCTURADA
+# Encadena: HeurÃ­stico â†’ PyMuPDF â†’ pdfplumber â†’ OCR
+# =========================================================
 
+def simplify_table_data(table_data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Post-procesa la matriz cruda:
+    1. Fusiona filas de continuaciÃ³n (col 0 == None â†’ misma celda lÃ³gica).
+    2. Elimina columnas que son null en todas las filas.
+    """
+    if not table_data or not table_data.get("rows"):
+        return table_data
 
-def build_hierarchy(chapters, hinges, all_questions):
-    timeline = []
-    for ch in chapters: timeline.append({"kind": "chapter", "sort_key": ch["sort_key"], "data": ch})
-    for h in hinges:   timeline.append({"kind": "hinge",   "sort_key": h["sort_key"],  "data": h})
-    for q in all_questions: timeline.append({"kind": "question", "sort_key": q["sort_key"], "data": q})
-    timeline.sort(key=lambda x: x["sort_key"])
+    rows = table_data["rows"]
+    num_cols = table_data.get("num_cols", 0)
+    method = table_data.get("method", "unknown")
+    if num_cols == 0:
+        return table_data
 
-    result = []; cur_ch = None; cur_h = None
+    # --- 1. Fusionar filas de continuaciÃ³n ---
+    merged: List[List[Optional[str]]] = []
+    for row in rows:
+        padded: List[Optional[str]] = list(row) + [None] * (num_cols - len(row))
 
-    def fin_h():
-        nonlocal cur_h
-        if cur_h and cur_ch: cur_ch["hinges"].append(cur_h)
-        cur_h = None
+        if merged and padded[0] is None:
+            prev = merged[-1]
+            for c in range(num_cols):
+                if padded[c] is not None:
+                    if prev[c] is not None:
+                        prev[c] = prev[c].rstrip() + " " + padded[c].lstrip()
+                    else:
+                        prev[c] = padded[c]
+        else:
+            merged.append(list(padded))
 
-    def fin_ch():
-        nonlocal cur_ch, cur_h
-        fin_h()
-        if cur_ch: result.append(cur_ch)
-        cur_ch = None
+    # --- 2. Eliminar columnas totalmente null ---
+    cols_to_keep = [
+        c for c in range(num_cols)
+        if any(row[c] is not None for row in merged)
+    ]
 
-    for item in timeline:
-        k = item["kind"]
-        if k == "chapter":
-            fin_ch()
-            d = item["data"]
-            cur_ch = {"page": d["page"], "text": d["text"], "bbox": d["bbox"],
-                      "questions": [], "hinges": [], "questions_without_hinge": []}
-            cur_h = None
-        elif k == "hinge":
-            if not cur_ch: continue
-            fin_h()
-            d = item["data"]
-            cur_h = {"page": d["page"], "text": d["text"], "bbox": d["bbox"], "questions": []}
-        elif k == "question":
-            qn = item["data"]["num"]
-            if cur_ch:
-                cur_ch["questions"].append(qn)
-                if cur_h: cur_h["questions"].append(qn)
-                else: cur_ch["questions_without_hinge"].append(qn)
-    fin_ch()
+    final_rows = [
+        [row[c] for c in cols_to_keep]
+        for row in merged
+    ]
+
+    result = {
+        "rows": final_rows,
+        "num_rows": len(final_rows),
+        "num_cols": len(cols_to_keep),
+        "method": method,
+    }
+
+    # ValidaciÃ³n: si quedÃ³ solo 1 fila con 1 columna, descartar
+    if result["num_rows"] <= 1 and result["num_cols"] <= 1:
+        return None
+
     return result
 
 
-def build_question_lookup(hierarchy):
-    lookup = {}
-    for ch in hierarchy:
-        for h in ch["hinges"]:
-            for qn in h["questions"]:
-                lookup[qn] = {"capitulo": ch["text"], "bisagra": h["text"]}
-        for qn in ch["questions_without_hinge"]:
-            lookup[qn] = {"capitulo": ch["text"], "bisagra": None}
-    return lookup
+def extract_table_structured(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    pdf_path: str,
+    page_index0: int,
+    image_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Intenta extraer la estructura de celdas usando 4 mÃ©todos en cascada:
+    1. HeurÃ­stico basado en lÃ­neas vectoriales + texto con coordenadas
+    2. PyMuPDF find_tables (rÃ¡pido, nativo)
+    3. pdfplumber (robusto)
+    4. OCR desde screenshot PNG de la tabla
+    """
+
+    # --- MÃ©todo 1: HeurÃ­stico ---
+    result = _heuristic_extract_table(page, rect)
+    if result:
+        simplified = simplify_table_data(result)
+        if simplified and simplified["num_rows"] >= 2:
+            return simplified
+
+    # --- MÃ©todo 2: PyMuPDF find_tables ---
+    result = _pymupdf_extract_table(page, rect)
+    if result:
+        simplified = simplify_table_data(result)
+        if simplified and simplified["num_rows"] >= 2:
+            return simplified
+
+    # --- MÃ©todo 3: pdfplumber ---
+    result = _pdfplumber_extract_table(pdf_path, page_index0, rect)
+    if result:
+        simplified = simplify_table_data(result)
+        if simplified and simplified["num_rows"] >= 2:
+            return simplified
+
+    # --- MÃ©todo 4: OCR desde screenshot ---
+    result = _ocr_extract_table(image_path)
+    if result:
+        simplified = simplify_table_data(result)
+        if simplified:
+            return simplified
+
+    return None
 
 
-# #############################################################################
-#  ASOCIAR TABLAS/FIGURAS → PREGUNTA (por posición)
-# #############################################################################
-def find_parent_question(sort_keys, qs_sorted, page, y0):
-    idx = bisect_right(sort_keys, (page, y0)) - 1
-    return qs_sorted[idx]["num"] if idx >= 0 else None
+def table_data_to_markdown(table_data: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Renderiza table_data como string Markdown."""
+    if not table_data or not table_data.get("rows"):
+        return None
+
+    rows = table_data["rows"]
+    num_cols = table_data.get("num_cols", 0)
+    if num_cols == 0:
+        return None
+
+    lines = []
+    for i, row in enumerate(rows):
+        padded = list(row) + [None] * (num_cols - len(row))
+        cells = [str(c) if c is not None else "" for c in padded]
+        lines.append("| " + " | ".join(cells) + " |")
+        if i == 0:
+            lines.append("|" + "|".join(["---"] * num_cols) + "|")
+
+    return "\n".join(lines)
 
 
-# #############################################################################
-#  SALIDA
-# #############################################################################
-def save_outputs(out_dir, texto_total, preguntas_final, hierarchy):
-    outp = Path(out_dir)
-    outp.mkdir(parents=True, exist_ok=True)
-    (outp / "texto_total.txt").write_text(texto_total, encoding="utf-8")
-    (outp / "preguntas.json").write_text(json.dumps(preguntas_final, ensure_ascii=False, indent=2), encoding="utf-8")
-    with (outp / "preguntas.txt").open("w", encoding="utf-8") as f:
-        for p in preguntas_final:
-            f.write(SEPARADOR_PREGUNTA + "\n")
-            if p["capitulo"]: f.write(f"CAPITULO: {p['capitulo']}\n")
-            if p["bisagra"]:  f.write(f"BISAGRA: {p['bisagra']}\n")
-            f.write(f"NUMERO: {p['numero']}\n")
-            f.write(p["texto"] + "\n")
-            if p["tablas_figuras"]:
-                for tf in p["tablas_figuras"]:
-                    f.write(f"  [{tf['tipo'].upper()}] parte {tf['parte']}: {tf['png']}\n")
-        f.write(SEPARADOR_PREGUNTA + "\n")
-    (outp / "chapters_hinges.json").write_text(
-        json.dumps({"chapters": hierarchy}, ensure_ascii=False, indent=2), encoding="utf-8")
+# =========================================================
+# FALLBACK: reconstruir Markdown desde texto vectorial plano
+# cuando ningÃºn mÃ©todo estructurado funciona.
+# =========================================================
+
+def _fallback_text_to_markdown(vectorial_text: str) -> Optional[str]:
+    """
+    Intenta generar un Markdown mÃ­nimo a partir del texto plano
+    extraÃ­do del bbox de la tabla. Separa por lÃ­neas y busca
+    patrones tabulares.
+    """
+    if not vectorial_text or not vectorial_text.strip():
+        return None
+
+    lines = [l.strip() for l in vectorial_text.strip().split("\n") if l.strip()]
+    if len(lines) < 2:
+        return None
+
+    # Si parece que hay un patrÃ³n tabular (lÃ­neas con longitudes similares),
+    # renderizar como tabla de 1 columna al menos
+    md_lines = []
+    for i, line in enumerate(lines):
+        md_lines.append(f"| {line} |")
+        if i == 0:
+            md_lines.append("|---|")
+
+    return "\n".join(md_lines)
 
 
-# #############################################################################
-#  MAIN
-# #############################################################################
+# =========================================================
+# EXTRACCIÃ“N DE TABLAS (principal)
+# =========================================================
 
-from app.pipeline.types import ExtractionSummary
+def extract_tables(
+    doc: fitz.Document,
+    tables_dir: str,
+    page_text_blocks_by_page: Dict[int, List[Dict[str, Any]]],
+    pdf_path: str,
+) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[str, Any]]:
+    result = defaultdict(list)
 
-def run_extraction(pdf_path: Path | str, out_dir: Path | str, include_png: bool = True) -> ExtractionSummary:
-    pdf_path = Path(pdf_path)
-    outp = Path(out_dir)
+    tables_document: Dict[str, Any] = {
+        "pdf_path": pdf_path,
+        "tables_dir": tables_dir,
+        "tables": [],
+    }
 
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    total = 0
 
-    doc = fitz.open(str(pdf_path))
-    png_dir = outp / PNG_DIRNAME
+    for pno in range(len(doc)):
+        page = doc[pno]
+        page_no = pno + 1
+        text_blocks = page_text_blocks_by_page.get(page_no, [])
 
+        candidates = extract_table_candidates(page)
+
+        for idx, cand in enumerate(candidates, start=1):
+            rect = cand["bbox"]
+            methods = cand["methods"]
+
+            # Screenshot
+            file_name = f"page_{page_no:03d}_table_{idx:03d}.png"
+            file_path = None
+            try:
+                file_path = save_bbox_screenshot(
+                    doc=doc,
+                    page_index0=pno,
+                    bbox=rect,
+                    out_dir=tables_dir,
+                    fname=file_name,
+                    dpi=220,
+                )
+            except Exception:
+                file_path = None
+
+            caption = find_table_caption(text_blocks, rect)
+
+            # Texto vectorial directo
+            vectorial_text = page.get_text("text", clip=rect).strip()
+
+            # ===== ExtracciÃ³n estructurada con 4 mÃ©todos en cascada =====
+            table_data = extract_table_structured(
+                page=page,
+                rect=rect,
+                pdf_path=pdf_path,
+                page_index0=pno,
+                image_path=file_path,
+            )
+
+            # Markdown desde datos estructurados
+            table_md = table_data_to_markdown(table_data)
+
+            # Fallback: si no hay datos estructurados, generar Markdown
+            # mÃ­nimo desde el texto vectorial
+            if table_md is None and vectorial_text:
+                table_md = _fallback_text_to_markdown(vectorial_text)
+
+            # MÃ©todo de extracciÃ³n usado
+            extraction_method = table_data.get("method", "none") if table_data else "text_only"
+
+            table_item = {
+                "kind": "table",
+                "page": page_no,
+                "bbox": rect_to_tuple(rect),
+                "text": vectorial_text,
+                "ocr_text": "",
+                "table_data": table_data,
+                "table_md": table_md,
+                "table_file": file_path,
+                "caption": caption,
+                "detection_methods": methods,
+                "extraction_method": extraction_method,
+                "table_index_on_page": idx,
+            }
+
+            result[page_no].append(table_item)
+
+            tables_document["tables"].append({
+                "id": f"p{page_no:04d}_t{idx:02d}",
+                "page": page_no,
+                "table_index_on_page": idx,
+                "caption": caption,
+                "detection_methods": methods,
+                "extraction_method": extraction_method,
+                "bbox_pdf": rect_to_dict(rect),
+                "image_path": file_path,
+                "text_digital_pdf": vectorial_text,
+                "table_md": table_md,
+                "ocr_text_from_image": "",
+            })
+
+            total += 1
+
+    tables_document["table_count"] = total
+    tables_document["ocr_enabled"] = False
+    tables_document["extraction_methods_available"] = [
+        "pdfplumber" if PDFPLUMBER_AVAILABLE else "(pdfplumber no disponible)",
+        "pymupdf_find_tables",
+        "heuristic_grid",
+        "text_only (fallback)",
+    ]
+    return result, tables_document
+
+
+# =========================================================
+# FIGURAS / IMÃGENES
+# =========================================================
+
+MIN_IMAGE_WIDTH = 60.0
+MIN_IMAGE_HEIGHT = 60.0
+MIN_IMAGE_AREA = 5000.0
+IMAGE_DUP_IOU = 0.65
+IMAGE_MERGE_GAP = 6.0
+IMAGE_BBOX_PAD = 3.0
+
+
+def image_is_probably_noise(rect: fitz.Rect, page_rect: fitz.Rect) -> bool:
+    if is_inside_header_footer(rect, page_rect, header_ratio=0.08, footer_ratio=0.08):
+        return True
+    if rect.width < MIN_IMAGE_WIDTH:
+        return True
+    if rect.height < MIN_IMAGE_HEIGHT:
+        return True
+    if rect_area(rect) < MIN_IMAGE_AREA:
+        return True
+    return False
+
+
+def collect_image_candidates(page: fitz.Page) -> List[fitz.Rect]:
+    raw = page.get_text("dict")
+    page_rect = page.rect
+    candidates: List[fitz.Rect] = []
+
+    for block in raw.get("blocks", []):
+        if block.get("type") != 1:
+            continue
+
+        bbox = block.get("bbox")
+        if not bbox:
+            continue
+
+        rect = fitz.Rect(bbox)
+
+        if image_is_probably_noise(rect, page_rect):
+            continue
+
+        rect = expand_rect(rect, IMAGE_BBOX_PAD, page_rect)
+        candidates.append(rect)
+
+    if not candidates:
+        return []
+
+    candidates = merge_rects(candidates, gap=IMAGE_MERGE_GAP)
+    candidates = deduplicate_rects(candidates, iou_thr=IMAGE_DUP_IOU)
+    return candidates
+
+
+def extract_images(page: fitz.Page, images_dir: str) -> List[Dict[str, Any]]:
+    page_no = page.number + 1
+    candidates = collect_image_candidates(page)
+    images: List[Dict[str, Any]] = []
+
+    for idx, rect in enumerate(candidates, start=1):
+        file_name = f"page_{page_no:03d}_image_{idx:03d}.png"
+        file_path = os.path.join(images_dir, file_name)
+
+        try:
+            pix = page.get_pixmap(
+                matrix=fitz.Matrix(2, 2),
+                clip=rect,
+                alpha=False,
+            )
+            pix.save(file_path)
+        except Exception:
+            file_path = None
+
+        images.append(
+            {
+                "kind": "image",
+                "bbox": rect_to_tuple(rect),
+                "file": file_path,
+                "caption": None,
+                "detection_method": "image_block_bbox",
+                "width": round(float(rect.width), 2),
+                "height": round(float(rect.height), 2),
+                "area": round(float(rect_area(rect)), 2),
+            }
+        )
+
+    return images
+
+
+def attach_figure_captions(page_items: List[Dict[str, Any]]) -> None:
+    text_blocks = [x for x in page_items if x["kind"] == "text"]
+    image_blocks = [x for x in page_items if x["kind"] == "image"]
+
+    for img in image_blocks:
+        img_rect = fitz.Rect(img["bbox"])
+        best = None
+        best_score = 1e9
+
+        for txt in text_blocks:
+            tt = txt["text"].strip()
+            if not RE_FIG.match(tt):
+                continue
+
+            txt_rect = fitz.Rect(txt["bbox"])
+
+            horizontal_overlap = max(
+                0.0,
+                min(img_rect.x1, txt_rect.x1) - max(img_rect.x0, txt_rect.x0),
+            )
+            min_width = max(1.0, min(img_rect.width, txt_rect.width))
+            overlap_ratio = horizontal_overlap / min_width
+
+            if overlap_ratio < 0.20:
+                continue
+
+            if txt_rect.y0 >= img_rect.y1:
+                dist = txt_rect.y0 - img_rect.y1
+                bias = 0
+            elif img_rect.y0 >= txt_rect.y1:
+                dist = img_rect.y0 - txt_rect.y1
+                bias = 10
+            else:
+                dist = 0
+                bias = 30
+
+            if dist > 120:
+                continue
+
+            score = dist + bias
+            if score < best_score:
+                best = txt
+                best_score = score
+
+        if best:
+            img["caption"] = best["text"]
+
+
+# =========================================================
+# EXCLUSIÃ“N DE TEXTO DENTRO DE TABLAS
+# =========================================================
+
+def intersection_area(a, b):
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0)
+
+
+def area(b):
+    return max(0.0, (b[2] - b[0])) * max(0.0, (b[3] - b[1]))
+
+
+def text_block_belongs_to_table(text_block, table_block, min_overlap_ratio=0.01):
+    if text_block["page"] != table_block["page"]:
+        return False
+
+    inter = intersection_area(text_block["bbox"], table_block["bbox"])
+    if inter <= 0:
+        return False
+
+    text_area = area(text_block["bbox"])
+    if text_area <= 0:
+        return False
+
+    overlap = inter / text_area
+    return overlap >= min_overlap_ratio
+
+
+def remove_table_text_blocks(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    tables_by_page = defaultdict(list)
+    for item in items:
+        if item["kind"] == "table":
+            tables_by_page[item["page"]].append(item)
+
+    cleaned = []
+    for item in items:
+        if item["kind"] != "text":
+            cleaned.append(item)
+            continue
+
+        text = item.get("text", "").strip()
+
+        if RE_OBS.match(text) or RE_SEC1.match(text) or RE_SEC2.match(text):
+            cleaned.append(item)
+            continue
+
+        if RE_FIG.match(text) or RE_TABLA.match(text):
+            cleaned.append(item)
+            continue
+
+        page_tables = tables_by_page.get(item["page"], [])
+        inside_table = any(text_block_belongs_to_table(item, tb) for tb in page_tables)
+
+        if not inside_table:
+            cleaned.append(item)
+
+    return cleaned
+
+
+# =========================================================
+# ASIGNACIÃ“N DE SECCIONES Y OBSERVACIONES
+# =========================================================
+
+def _resolve_pending_sections(
+    obs_prefix: str,
+    current_sec1_name: Optional[str],
+    current_sec2_name: Optional[str],
+    pending_sec1: Optional[Tuple[str, str]],
+    pending_sec2: Optional[Tuple[str, str]],
+) -> Tuple[Optional[str], Optional[str], Optional[Tuple[str, str]], Optional[Tuple[str, str]]]:
+    """
+    Cuando una nueva observaciÃ³n comienza, valida si los cambios de secciÃ³n
+    pendientes son coherentes con el prefijo de la observaciÃ³n.
+    Ej: si pending_sec1 = ("8.", "Plan de cumplimiento...") y la nueva obs
+    es "8.1.1.", el prefijo 8 coincide â†’ se aplica el cambio.
+    Si pending_sec1 = ("21.", "Skytanthus...") y la obs es "7.6.5.",
+    el prefijo 21 â‰  7 â†’ se descarta (era un Ã­tem de lista).
+    """
+    obs_parts = obs_prefix.rstrip(".").split(".")
+
+    # --- Resolver secciÃ³n 1 pendiente ---
+    if pending_sec1 is not None and len(obs_parts) >= 1:
+        try:
+            obs_sec1_num = int(obs_parts[0])
+            pending_sec1_num = int(pending_sec1[0].replace(".", ""))
+            if obs_sec1_num == pending_sec1_num:
+                # Confirmado: la observaciÃ³n pertenece a esta nueva secciÃ³n
+                current_sec1_name = f"{pending_sec1[0]} {pending_sec1[1]}".strip()
+                current_sec2_name = None
+        except (ValueError, IndexError):
+            pass
+        pending_sec1 = None
+
+    # --- Resolver secciÃ³n 2 pendiente ---
+    if pending_sec2 is not None and len(obs_parts) >= 2:
+        try:
+            obs_sec2_prefix = f"{obs_parts[0]}.{obs_parts[1]}."
+            if pending_sec2[0] == obs_sec2_prefix:
+                # Confirmado: la observaciÃ³n pertenece a esta nueva subsecciÃ³n
+                current_sec2_name = f"{pending_sec2[0]} {pending_sec2[1]}".strip()
+        except (ValueError, IndexError):
+            pass
+        pending_sec2 = None
+
+    return current_sec1_name, current_sec2_name, pending_sec1, pending_sec2
+
+
+def detect_sections_and_observations(items: List[Dict[str, Any]]) -> None:
+    current_sec1_name = None
+    current_sec2_name = None
+    current_obs = None
+
+    # Secciones pendientes: se guardan cuando un cambio de secciÃ³n ocurre
+    # dentro de una observaciÃ³n activa. Solo se aplican cuando la siguiente
+    # observaciÃ³n (RE_OBS) confirma con su prefijo que el cambio es real.
+    # Esto evita que listas numeradas ("1. Especie", "21. Especie") dentro
+    # de una observaciÃ³n corrompan los tÃ­tulos de secciÃ³n.
+    pending_sec1: Optional[Tuple[str, str]] = None  # (prefix, name)
+    pending_sec2: Optional[Tuple[str, str]] = None
+
+    for item in items:
+        if item["kind"] != "text":
+            item["section_1"] = current_sec1_name
+            item["section_2"] = current_sec2_name
+            item["observation_id"] = current_obs
+            continue
+
+        text = item["text"]
+
+        m_obs = RE_OBS.match(text)
+        m_sec2 = RE_SEC2.match(text)
+        m_sec1 = RE_SEC1.match(text)
+
+        if m_obs:
+            # Resolver secciones pendientes antes de iniciar la nueva observaciÃ³n
+            (current_sec1_name, current_sec2_name,
+             pending_sec1, pending_sec2) = _resolve_pending_sections(
+                m_obs.group(1),
+                current_sec1_name, current_sec2_name,
+                pending_sec1, pending_sec2,
+            )
+
+            current_obs = m_obs.group(1)
+            item["section_1"] = current_sec1_name
+            item["section_2"] = current_sec2_name
+            item["observation_id"] = current_obs
+            continue
+
+        if m_sec2 and not is_observation_prefix(m_sec2.group(1)):
+            sec2_prefix = m_sec2.group(1).strip()
+            sec2_name = m_sec2.group(2).strip()
+
+            if is_level2_observation_text(text):
+                # Es una observaciÃ³n de nivel 2 â€” resolver pendientes primero
+                (current_sec1_name, current_sec2_name,
+                 pending_sec1, pending_sec2) = _resolve_pending_sections(
+                    sec2_prefix,
+                    current_sec1_name, current_sec2_name,
+                    pending_sec1, pending_sec2,
+                )
+                current_obs = sec2_prefix
+                item["section_1"] = current_sec1_name
+                item["section_2"] = current_sec2_name
+                item["observation_id"] = current_obs
+                continue
+
+            if current_obs is not None:
+                # Dentro de una observaciÃ³n: guardar como pendiente
+                if sec2_name and not re.match(r"^\d", sec2_name):
+                    pending_sec2 = (sec2_prefix, sec2_name)
+                item["section_1"] = current_sec1_name
+                item["section_2"] = current_sec2_name
+                item["observation_id"] = current_obs
+                continue
+
+            # Fuera de observaciÃ³n: aplicar directamente
+            if sec2_name and not re.match(r"^\d", sec2_name):
+                current_sec2_name = f"{sec2_prefix} {sec2_name}".strip()
+                current_obs = None
+                pending_sec2 = None
+
+            item["section_1"] = current_sec1_name
+            item["section_2"] = current_sec2_name
+            item["observation_id"] = current_obs
+            continue
+
+        if m_sec1 and m_sec1.group(1).count(".") == 1:
+            sec1_prefix = m_sec1.group(1).strip()
+            sec1_name = m_sec1.group(2).strip()
+
+            if current_obs is not None:
+                # Dentro de una observaciÃ³n: guardar como pendiente
+                if sec1_name and not re.match(r"^\d", sec1_name):
+                    pending_sec1 = (sec1_prefix, sec1_name)
+                item["section_1"] = current_sec1_name
+                item["section_2"] = current_sec2_name
+                item["observation_id"] = current_obs
+                continue
+
+            # Fuera de observaciÃ³n: aplicar directamente
+            if sec1_name and not re.match(r"^\d", sec1_name):
+                current_sec1_name = f"{sec1_prefix} {sec1_name}".strip()
+                current_sec2_name = None
+                current_obs = None
+                pending_sec1 = None
+
+            item["section_1"] = current_sec1_name
+            item["section_2"] = current_sec2_name
+            item["observation_id"] = current_obs
+            continue
+
+        item["section_1"] = current_sec1_name
+        item["section_2"] = current_sec2_name
+        item["observation_id"] = current_obs
+
+
+def attach_non_text_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    current_sec1 = None
+    current_sec2 = None
+    current_obs = None
+
+    for item in items:
+        if item["kind"] == "text":
+            current_sec1 = item.get("section_1")
+            current_sec2 = item.get("section_2")
+            current_obs = item.get("observation_id")
+        else:
+            item["section_1"] = current_sec1
+            item["section_2"] = current_sec2
+            item["observation_id"] = current_obs
+
+    return items
+
+
+# =========================================================
+# SALIDA FINAL
+# CAMBIO: las tablas ahora incluyen table_data, table_md,
+# y extraction_method en el JSON de salida.
+# =========================================================
+
+def build_output(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    obs_map: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+
+    for item in items:
+        obs_id = item.get("observation_id")
+        if not obs_id:
+            continue
+
+        if obs_id not in obs_map:
+            obs_map[obs_id] = {
+                "observation_id": obs_id,
+                "section_1": item.get("section_1"),
+                "section_2": item.get("section_2"),
+                "requirement_types": set(),
+                "text_parts": [],
+                "tables": [],
+                "images": [],
+            }
+            order.append(obs_id)
+
+        entry = obs_map[obs_id]
+
+        if item["kind"] == "text":
+            t = item["text"].strip()
+            if RE_TABLA_STRICT.match(t) or RE_FIG.match(t):
+                pass
+            else:
+                entry["text_parts"].append((item["page"], item["bbox"][1], item["text"]))
+                entry["requirement_types"].update(detect_requirement_types(item["text"]))
+
+        elif item["kind"] == "table":
+            td = item.get("table_data")
+            # Extraer rows del table_data; si no hay, fallback a texto plano
+            if td and td.get("rows"):
+                rows = td["rows"]
+            else:
+                # Fallback: texto plano como filas de 1 columna
+                raw_text = item.get("text", "").strip()
+                if raw_text:
+                    rows = [[line.strip()] for line in raw_text.split("\n") if line.strip()]
+                else:
+                    rows = []
+            entry["tables"].append(
+                {
+                    "table_file": item.get("table_file"),
+                    "rows": rows,
+                }
+            )
+
+        elif item["kind"] == "image":
+            entry["images"].append(
+                {
+                    "image_file": item.get("file"),
+                    "caption": item.get("caption"),
+                }
+            )
+
+    output = []
+    for obs_id in order:
+        entry = obs_map[obs_id]
+        entry["text_parts"].sort(key=lambda x: (x[0], x[1]))
+        full_text = one_line(" ".join(p[2] for p in entry["text_parts"] if p[2]))
+
+        # --- Limpiar tÃ­tulos de secciÃ³n residuales al final del texto ---
+        # En el PDF, tÃ­tulos como "1.2. UbicaciÃ³n" o "7.7. Fauna" aparecen
+        # como texto al final del Ãºltimo pÃ¡rrafo de la observaciÃ³n anterior.
+        # Se eliminan iterativamente (puede haber mÃ¡s de uno encadenado).
+        # Requisitos para detectar un tÃ­tulo residual:
+        #   1. Precedido por un carÃ¡cter de fin de oraciÃ³n (. : ) ] ")
+        #   2. NÃºmero de secciÃ³n (ej: "1.", "1.2.", "7.7.")
+        #   3. Seguido de texto que empieza en mayÃºscula (â‰¥3 chars)
+        while True:
+            m = re.search(
+                r'([.:)\]"])\s+(\d+(?:\.\d+)*\.)\s+([A-ZÃÃ‰ÃÃ“ÃšÃ‘].{2,})\s*$',
+                full_text,
+            )
+            if not m:
+                break
+            full_text = full_text[: m.start(1) + 1].strip()
+
+        output.append(
+            {
+                "observation_id": entry["observation_id"],
+                "section_1": entry["section_1"],
+                "section_2": entry["section_2"],
+                "requirement_types": sorted(entry["requirement_types"]),
+                "text": full_text,
+                "tables": entry["tables"],
+                "images": entry["images"],
+            }
+        )
+
+    return output
+
+
+# =========================================================
+# PROCESO PRINCIPAL
+# =========================================================
+
+def build_summary(output: List[Dict[str, Any]], tables_document: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Genera indicadores y estadÃ­sticas del ICSARA procesado.
+    """
+    total_obs = len(output)
+
+    # --- DistribuciÃ³n por secciÃ³n 1 ---
+    sec1_counts: Dict[str, int] = defaultdict(int)
+    for obs in output:
+        sec1 = obs.get("section_1") or "(sin secciÃ³n)"
+        sec1_counts[sec1] += 1
+
+    # --- DistribuciÃ³n por secciÃ³n 2 ---
+    sec2_counts: Dict[str, int] = defaultdict(int)
+    for obs in output:
+        sec2 = obs.get("section_2")
+        if sec2:
+            sec2_counts[sec2] += 1
+
+    # --- Ranking de requirement_types ---
+    req_counts: Dict[str, int] = defaultdict(int)
+    for obs in output:
+        for rt in obs.get("requirement_types", []):
+            req_counts[rt] += 1
+    req_ranking = sorted(req_counts.items(), key=lambda x: x[1], reverse=True)
+
+    # --- Tablas e imÃ¡genes ---
+    total_tables = sum(len(obs.get("tables", [])) for obs in output)
+    total_images = sum(len(obs.get("images", [])) for obs in output)
+    obs_with_tables = sum(1 for obs in output if obs.get("tables"))
+    obs_with_images = sum(1 for obs in output if obs.get("images"))
+    obs_only_text = sum(
+        1 for obs in output
+        if not obs.get("tables") and not obs.get("images")
+    )
+
+    # --- MÃ©todos de extracciÃ³n de tablas ---
+    extraction_methods: Dict[str, int] = defaultdict(int)
+    for t in tables_document.get("tables", []):
+        m = t.get("extraction_method", "unknown")
+        extraction_methods[m] += 1
+
+    # --- Largo promedio de texto ---
+    text_lengths = [len(obs.get("text", "")) for obs in output]
+    avg_text_len = round(sum(text_lengths) / len(text_lengths), 1) if text_lengths else 0
+    max_text_len = max(text_lengths) if text_lengths else 0
+    max_text_obs = ""
+    if text_lengths:
+        max_idx = text_lengths.index(max_text_len)
+        max_text_obs = output[max_idx].get("observation_id", "")
+
+    # --- Observaciones por complejidad (cantidad de requirement_types) ---
+    complexity = {"baja (1-2)": 0, "media (3-5)": 0, "alta (6+)": 0}
+    for obs in output:
+        n = len(obs.get("requirement_types", []))
+        if n <= 2:
+            complexity["baja (1-2)"] += 1
+        elif n <= 5:
+            complexity["media (3-5)"] += 1
+        else:
+            complexity["alta (6+)"] += 1
+
+    return {
+        "total_observaciones": total_obs,
+        "total_tablas": total_tables,
+        "total_imagenes": total_images,
+        "observaciones_con_tablas": obs_with_tables,
+        "observaciones_con_imagenes": obs_with_images,
+        "observaciones_solo_texto": obs_only_text,
+        "complejidad_observaciones": complexity,
+        "largo_promedio_texto_chars": avg_text_len,
+        "observacion_mas_larga": {
+            "observation_id": max_text_obs,
+            "chars": max_text_len,
+        },
+        "distribucion_seccion_1": dict(
+            sorted(sec1_counts.items(), key=lambda x: x[1], reverse=True)
+        ),
+        "distribucion_seccion_2": dict(
+            sorted(sec2_counts.items(), key=lambda x: x[1], reverse=True)
+        ),
+        "ranking_requirement_types": [
+            {"tipo": rt, "frecuencia": count} for rt, count in req_ranking
+        ],
+        "metodos_extraccion_tablas": dict(extraction_methods),
+    }
+
+
+# =========================================================
+# PROCESO PRINCIPAL (con progreso en vivo)
+# =========================================================
+
+def _log(msg: str) -> None:
+    """Print con flush inmediato para progreso en vivo."""
+    print(msg, flush=True)
+
+
+def process_pdf(pdf_path: str, base_dir: str, artifact_stem: str | None = None) -> Tuple[str, str, str]:
+    if not os.path.isfile(pdf_path):
+        raise FileNotFoundError(f"No existe el PDF: {pdf_path}")
+
+    stem = artifact_stem or pdf_stem(pdf_path)
+    out_dir = base_dir
+    images_dir = os.path.join(out_dir, "images")
+    tables_dir = os.path.join(out_dir, "tables")
+    main_json_path = os.path.join(out_dir, f"{stem}.json")
+    tables_json_path = os.path.join(out_dir, "tablas_detectadas.json")
+    resumen_json_path = os.path.join(out_dir, "resumen.json")
+
+    ensure_dir(out_dir)
+    ensure_dir(images_dir)
+    ensure_dir(tables_dir)
+
+    _log(f"â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+    _log(f"  ICSARA PDF Parser v3")
+    _log(f"  PDF: {os.path.basename(pdf_path)}")
+    _log(f"  Salida: {out_dir}")
+    _log(f"â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+
+    # --- Fase 1: Abrir PDF ---
+    _log(f"\n[1/7] Abriendo PDF...")
+    doc = fitz.open(pdf_path)
     total_pages = len(doc)
+    _log(f"       â†’ {total_pages} pÃ¡ginas detectadas")
 
-    # FASE 1: Detectar tablas/figuras + extraer texto sin tablas
-    all_detections = []
-    pages_text_clean = []
-    all_page_layout_data = []
-    exclude_by_page = {}
+    # --- Fase 2: ExtracciÃ³n de texto ---
+    _log(f"\n[2/7] Extrayendo texto por pÃ¡gina...")
+    page_text_blocks_by_page: Dict[int, List[Dict[str, Any]]] = {}
+    total_blocks = 0
+
+    for pno in range(total_pages):
+        page = doc[pno]
+        page_no = pno + 1
+        page_height = float(page.rect.height)
+
+        lines = extract_lines(page)
+        text_blocks = group_lines(lines)
+        text_blocks = merge_adjacent_blocks(text_blocks)
+        text_blocks = [
+            b for b in text_blocks
+            if not (
+                is_footer_or_noise(b.get("text", ""))
+                or is_footer_zone(b.get("bbox", (0, 0, 0, 0)), page_height, threshold=0.9)
+            )
+        ]
+
+        for b in text_blocks:
+            b["page"] = page_no
+
+        page_text_blocks_by_page[page_no] = text_blocks
+        total_blocks += len(text_blocks)
+
+        if page_no % 10 == 0 or page_no == total_pages:
+            _log(f"       â†’ PÃ¡gina {page_no}/{total_pages} ({total_blocks} bloques acumulados)")
+
+    _log(f"       âœ“ {total_blocks} bloques de texto extraÃ­dos")
+
+    # --- Fase 3: DetecciÃ³n y extracciÃ³n de tablas ---
+    _log(f"\n[3/7] Detectando y extrayendo tablas...")
+    tables_by_page, tables_document = extract_tables(
+        doc=doc,
+        tables_dir=tables_dir,
+        page_text_blocks_by_page=page_text_blocks_by_page,
+        pdf_path=pdf_path,
+    )
+    total_tables = tables_document.get("table_count", 0)
+    _log(f"       âœ“ {total_tables} tablas detectadas")
+
+    # Mostrar mÃ©todos de extracciÃ³n
+    method_counts: Dict[str, int] = defaultdict(int)
+    for t in tables_document.get("tables", []):
+        method_counts[t.get("extraction_method", "unknown")] += 1
+    for method, count in sorted(method_counts.items()):
+        _log(f"         Â· {method}: {count}")
+
+    # --- Fase 4: ExtracciÃ³n de imÃ¡genes ---
+    _log(f"\n[4/7] Extrayendo imÃ¡genes...")
+    all_items: List[Dict[str, Any]] = []
+    total_images = 0
 
     for pno in range(total_pages):
         page = doc[pno]
         page_no = pno + 1
 
-        tables = extract_table_candidates(page)
-        figs = extract_raster_figures(page)
-        excludes = tables + figs
-        exclude_by_page[page_no] = excludes
+        text_blocks = page_text_blocks_by_page.get(page_no, [])
+        table_items = tables_by_page.get(page_no, [])
+        image_items = extract_images(page, images_dir)
 
-        for r in tables:
-            all_detections.append({
-                "tipo": "tabla", "page": page_no, "page_idx": pno,
-                "bbox": r, "pregunta": None, "parte": None, "png": None,
-            })
-        for r in figs:
-            all_detections.append({
-                "tipo": "figura", "page": page_no, "page_idx": pno,
-                "bbox": r, "pregunta": None, "parte": None, "png": None,
-            })
+        for im in image_items:
+            im["page"] = page_no
 
-        page_text = extract_page_text_excluding_bboxes(page, excludes)
-        pages_text_clean.append(page_text)
+        total_images += len(image_items)
 
-        spans = extract_spans(page)
-        lines = build_lines_from_spans(spans)
-        bold_lines = [ln for ln in lines if ln["is_bold_line"] and ln["text"]]
-        merged_bolds = merge_bold_lines(bold_lines)
-        qstarts = detect_qstarts_layout(lines, excludes, page_no)
+        page_items = []
+        page_items.extend(text_blocks)
+        page_items.extend(table_items)
+        page_items.extend(image_items)
+        page_items.sort(key=lambda x: (x["page"], round(x["bbox"][1], 1), round(x["bbox"][0], 1)))
 
-        all_page_layout_data.append({
-            "page_no": page_no,
-            "page_height": page.rect.height,
-            "merged_bolds": merged_bolds,
-            "qstarts": qstarts,
-        })
+        attach_figure_captions(page_items)
+        all_items.extend(page_items)
 
-    # FASE 2: Texto plano -> preguntas
-    pages_lines = [normalize_lines_keep_empty(t) for t in pages_text_clean]
-    frequent_lines = build_frequent_line_filter(pages_lines)
-    pages_clean_lines = [clean_page_lines_keep_empty(lines, frequent_lines) for lines in pages_lines]
-    texto_total = stitch_pages(pages_clean_lines)
-    preguntas_text = extract_questions_from_text(texto_total)
+    _log(f"       âœ“ {total_images} imÃ¡genes extraÃ­das")
 
-    # FASE 3: Layout -> capitulos, bisagras, jerarquia
-    all_chapters, all_hinges = [], []
-    for i, pd in enumerate(all_page_layout_data):
-        next_qs = all_page_layout_data[i + 1]["qstarts"] if i + 1 < len(all_page_layout_data) else None
-        excludes = exclude_by_page.get(pd["page_no"], [])
-        chs, hgs = classify_bolds(
-            pd["merged_bolds"],
-            pd["qstarts"],
-            excludes,
-            pd["page_no"],
-            pd["page_height"],
-            next_qstarts=next_qs,
-        )
-        all_chapters.extend(chs)
-        all_hinges.extend(hgs)
+    # --- Fase 5: Filtrado y asignaciÃ³n de secciones ---
+    _log(f"\n[5/7] Asignando secciones y observaciones...")
+    filtered_items = []
+    for item in all_items:
+        if item["kind"] == "text" and RE_FIG.match(item["text"]):
+            continue
+        filtered_items.append(item)
 
-    all_qs_raw = []
-    for pd in all_page_layout_data:
-        for qs in pd["qstarts"]:
-            all_qs_raw.append({
-                "num": qs["num"],
-                "page": pd["page_no"],
-                "sort_key": (pd["page_no"], qs["bbox"].y0),
-            })
+    filtered_items.sort(key=lambda x: (x["page"], round(x["bbox"][1], 1), round(x["bbox"][0], 1)))
+    filtered_items = remove_table_text_blocks(filtered_items)
 
-    all_qs_filtered = filter_questions_by_continuity(all_qs_raw)
-    hierarchy = build_hierarchy(all_chapters, all_hinges, all_qs_filtered)
-    lookup = build_question_lookup(hierarchy)
+    detect_sections_and_observations(filtered_items)
+    filtered_items = attach_non_text_items(filtered_items)
+    _log(f"       âœ“ {len(filtered_items)} Ã­tems procesados")
 
-    # FASE 4: Asociar detecciones -> preguntas + exportar PNGs (opcional)
-    sort_keys = [(q["page"], q["sort_key"][1]) for q in sorted(all_qs_filtered, key=lambda q: q["sort_key"])]
-    qs_sorted = sorted(all_qs_filtered, key=lambda q: q["sort_key"])
-    part_counters = defaultdict(int)
+    # --- Fase 6: ConstrucciÃ³n del JSON de salida ---
+    _log(f"\n[6/7] Construyendo JSON de observaciones...")
+    output = build_output(filtered_items)
+    _log(f"       âœ“ {len(output)} observaciones sistematizadas")
 
-    for det in all_detections:
-        parent_q = find_parent_question(sort_keys, qs_sorted, det["page"], det["bbox"].y0)
-        det["pregunta"] = parent_q
-        q_label = f"{parent_q:03d}" if parent_q is not None else "000"
-        part_counters[(q_label, det["tipo"])] += 1
-        parte = part_counters[(q_label, det["tipo"])]
-        det["parte"] = parte
+    # Conteo rÃ¡pido
+    obs_with_t = sum(1 for o in output if o.get("tables"))
+    obs_with_i = sum(1 for o in output if o.get("images"))
+    _log(f"         Â· Con tablas: {obs_with_t}")
+    _log(f"         Â· Con imÃ¡genes: {obs_with_i}")
+    _log(f"         Â· Solo texto: {len(output) - obs_with_t - obs_with_i + sum(1 for o in output if o.get('tables') and o.get('images'))}")
 
-        fname = f"p{q_label}_parte{parte:03d}_{det['tipo']}.png"
-        det["png"] = fname
-        if include_png:
-            save_bbox_screenshot(doc, det["page_idx"], det["bbox"], png_dir, fname)
+    # --- Fase 7: Generar resumen e indicadores ---
+    _log(f"\n[7/7] Generando resumen e indicadores...")
+    summary = build_summary(output, tables_document)
+
+    # Guardar archivos
+    with open(main_json_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    with open(tables_json_path, "w", encoding="utf-8") as f:
+        json.dump(tables_document, f, ensure_ascii=False, indent=2)
+
+    with open(resumen_json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
 
     doc.close()
 
-    # FASE 5: Cruzar preguntas + limpiezas + asociar tablas/figuras
-    all_hinge_texts = []
-    for ch in hierarchy:
-        for h in ch["hinges"]:
-            all_hinge_texts.append(h["text"])
+    # --- Resumen final en pantalla ---
+    _log(f"\nâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+    _log(f"  RESULTADO")
+    _log(f"â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+    _log(f"  Observaciones: {summary['total_observaciones']}")
+    _log(f"  Tablas:        {summary['total_tablas']}")
+    _log(f"  ImÃ¡genes:      {summary['total_imagenes']}")
+    _log(f"  Complejidad:   {summary['complejidad_observaciones']}")
+    _log(f"")
+    _log(f"  Top 5 requirement_types:")
+    for item in summary["ranking_requirement_types"][:5]:
+        _log(f"    Â· {item['tipo']}: {item['frecuencia']}")
+    _log(f"")
+    _log(f"  Archivos generados:")
+    _log(f"    Â· {main_json_path}")
+    _log(f"    Â· {tables_json_path}")
+    _log(f"    Â· {resumen_json_path}")
+    _log(f"â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
 
-    dets_by_q = defaultdict(list)
-    for det in all_detections:
-        if det["pregunta"] is not None:
-            dets_by_q[det["pregunta"]].append({
-                "tipo": det["tipo"],
-                "parte": det["parte"],
-                "png": det["png"],
-            })
+    return main_json_path, tables_json_path, resumen_json_path
 
-    preguntas_final = []
-    for p in preguntas_text:
-        num = p["numero"]
-        info = lookup.get(num, {})
-        texto = clean_trailing_hinge(clean_firma_digital(p["texto"]), all_hinge_texts)
-        tf_list = sorted(dets_by_q.get(num, []), key=lambda x: (x["tipo"], x["parte"]))
 
-        preguntas_final.append({
-            "capitulo": info.get("capitulo", ""),
-            "bisagra": info.get("bisagra"),
-            "numero": num,
-            "texto": texto,
-            "tablas_figuras": tf_list,
-        })
+def run_extraction(
+    pdf_path: Path | str,
+    out_dir: Path | str,
+    include_png: bool = True,
+    artifact_stem: str | None = None,
+) -> ExtractionSummary:
+    del include_png  # The validated parser always exports its media assets.
 
-    save_outputs(outp, texto_total, preguntas_final, hierarchy)
+    pdf_path = Path(pdf_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    n_caps = len(hierarchy)
-    n_bis = sum(len(ch["hinges"]) for ch in hierarchy)
-    n_preg = len(preguntas_final)
-    n_det = len(all_detections)
-    n_tab = sum(1 for d in all_detections if d["tipo"] == "tabla")
-    n_fig = sum(1 for d in all_detections if d["tipo"] == "figura")
+    main_json, tables_json, resumen_json = process_pdf(
+        str(pdf_path),
+        str(out_dir),
+        artifact_stem=artifact_stem,
+    )
+
+    with open(resumen_json, "r", encoding="utf-8") as handle:
+        resumen = json.load(handle)
+
+    with fitz.open(str(pdf_path)) as doc:
+        pages = len(doc)
 
     return ExtractionSummary(
-        pages=total_pages,
-        capitulos=n_caps,
-        bisagras=n_bis,
-        preguntas=n_preg,
-        tablas=n_tab,
-        figuras=n_fig,
-        total_detections=n_det,
-        output_dir=outp,
+        pages=pages,
+        observaciones=int(resumen.get("total_observaciones", 0)),
+        tablas=int(resumen.get("total_tablas", 0)),
+        imagenes=int(resumen.get("total_imagenes", 0)),
+        output_dir=out_dir,
+        output_json=Path(main_json),
+        tables_json=Path(tables_json),
+        summary_json=Path(resumen_json),
+        images_dir=out_dir / "images",
+        tables_dir=out_dir / "tables",
     )
 
 
-def main() -> None:
-    if not PDF_PATH.exists():
-        print(f"No se encontro el PDF: {PDF_PATH}")
-        return
-    summary = run_extraction(pdf_path=PDF_PATH, out_dir=OUT_DIR, include_png=True)
-    print(f"PDF: {PDF_PATH}")
-    print(f"Paginas: {summary.pages}")
-    print(f"Capitulos: {summary.capitulos} | Bisagras: {summary.bisagras} | Preguntas: {summary.preguntas}")
-    print(f"Tablas: {summary.tablas} | Figuras: {summary.figuras} | Total detecciones: {summary.total_detections}")
-    print(f"PNGs en: {summary.output_dir / PNG_DIRNAME}")
-    print(f"Salida en: {summary.output_dir}")
-
+# =========================================================
+# ENTRYPOINT
+# =========================================================
 
 if __name__ == "__main__":
-    main()
+    try:
+        main_json, tables_json, resumen_json = process_pdf(PDF_PATH, BASE_DIR)
+    except Exception as e:
+        print(f"ERROR: {e}")
+

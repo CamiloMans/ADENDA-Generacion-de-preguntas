@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     google_client_secret_file: Path = Path("client_secret.json")
     google_token_file: Path = Path("token.json")
     google_drive_parent_folder_id: str = ""
+    anthropic_api_key: str = ""
+    anthropic_model: str = ""
+    anthropic_pdf_dpi: int = 150
 
     @property
     def api_key_set(self) -> set[str]:

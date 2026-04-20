@@ -29,6 +29,15 @@ router = APIRouter(prefix="/jobs", tags=["jobs"], dependencies=[Depends(require_
 PREGUNTAS_CLASIFICADAS_FILENAME: Final[str] = "preguntas_clasificadas.json"
 
 
+def _primary_result_filename(job: Job) -> str:
+    for artifact in job.artifacts:
+        if artifact.name.endswith("_revisado.json"):
+            return artifact.name
+    if any(artifact.name == PREGUNTAS_CLASIFICADAS_FILENAME for artifact in job.artifacts):
+        return PREGUNTAS_CLASIFICADAS_FILENAME
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Primary result artifact not found.")
+
+
 def _must_get_job(db: Session, job_id: UUID) -> Job:
     job = job_service.get_job(db, job_id)
     if not job:
@@ -205,7 +214,12 @@ def get_result_preguntas_clasificadas(job_id: UUID, db: Session = Depends(get_db
     if job.status != "done":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Job status is {job.status}.")
 
-    return _artifact_file_response(db, job.id, PREGUNTAS_CLASIFICADAS_FILENAME)
+    return _artifact_file_response(db, job.id, _primary_result_filename(job))
+
+
+@router.get("/{job_id}/preguntas_clasificadas")
+def get_preguntas_clasificadas_legacy(job_id: UUID, db: Session = Depends(get_db)) -> Response:
+    return get_result_preguntas_clasificadas(job_id=job_id, db=db)
 
 
 @router.get("/{job_id}/artifacts/{filename}")

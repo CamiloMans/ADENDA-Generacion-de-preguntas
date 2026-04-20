@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 from pathlib import Path
 from uuid import UUID
@@ -15,17 +16,6 @@ ALLOWED_PDF_CONTENT_TYPES = {
     "text/pdf",
     "text/x-pdf",
 }
-
-ALLOWED_ARTIFACT_NAMES = {
-    "preguntas.json",
-    "preguntas.txt",
-    "chapters_hinges.json",
-    "preguntas_clasificadas.json",
-    "preguntas_clasificadas_detalle.json",
-    "outputs_png.zip",
-    "texto_total.txt",
-}
-
 
 def job_dir(base_dir: Path, job_id: UUID) -> Path:
     return base_dir / str(job_id)
@@ -99,11 +89,23 @@ def remove_job_dir(base_dir: Path, job_id: UUID) -> None:
 
 
 def validate_artifact_name(filename: str) -> None:
-    if filename not in ALLOWED_ARTIFACT_NAMES:
+    if (
+        not filename
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or filename.strip() != filename
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Artifact not found.",
         )
+
+
+def sanitize_artifact_stem(filename: str) -> str:
+    stem = Path(filename or "upload.pdf").stem or "upload"
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    return sanitized or "upload"
 
 
 def sha256_file(path: Path) -> str:
