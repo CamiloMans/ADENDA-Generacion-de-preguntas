@@ -82,7 +82,7 @@ class Question(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     job_id: Mapped[UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
     adenda_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
-    numero: Mapped[int] = mapped_column(Integer, nullable=False)
+    numero: Mapped[int] = mapped_column(BigInteger, nullable=False)
     observation_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     orden: Mapped[int | None] = mapped_column(Integer, nullable=True)
     capitulo: Mapped[str] = mapped_column(Text, nullable=False, default="")
