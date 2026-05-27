@@ -6,6 +6,7 @@ from app.pipeline.review import (
     LectorPDF,
     _drop_false_positive_observations,
     _filter_parent_container_missing_ids,
+    _repair_cross_section_false_observations,
     aplicar_correcciones,
 )
 from app.services.google_drive_service import DriveFileRef
@@ -124,6 +125,56 @@ def test_filter_parent_container_missing_ids_keeps_real_gaps_only() -> None:
     )
 
     assert filtered == ["7.5."]
+
+
+def test_repair_cross_section_false_observation_recovers_embedded_question() -> None:
+    data = [
+        {
+            "observation_id": "7.4.",
+            "section_1": "7. Efectos",
+            "section_2": None,
+            "text": (
+                "7.4. Texto valido. Articulo 6 del RSEIA, del MMA "
+                "7.5. Respecto de la Respuesta 6.5.4 de la Adenda, "
+                "el Titular establece que el efluente cumplira la NCh"
+            ),
+        },
+        {
+            "observation_id": "1.333.",
+            "section_1": "7. Efectos",
+            "section_2": None,
+            "text": (
+                "1.333. Al respecto, se solicita al Titular presentar los "
+                "antecedentes de monitoreo y seguimiento. Flora y vegetacion"
+            ),
+            "clasificacion": {"tema_principal_id": "RECURSO_HIDRICO"},
+        },
+        {
+            "observation_id": "7.6.",
+            "section_1": "7. Efectos",
+            "section_2": None,
+            "text": "7.6. Otra observacion.",
+        },
+    ]
+
+    repaired, audit = _repair_cross_section_false_observations(data)
+    by_id = {item["observation_id"]: item for item in repaired}
+
+    assert [item["observation_id"] for item in repaired] == ["7.4.", "7.5.", "7.6."]
+    assert by_id["7.4."]["text"] == "7.4. Texto valido. Articulo 6 del RSEIA, del MMA"
+    assert by_id["7.5."]["text"] == (
+        "7.5. Respecto de la Respuesta 6.5.4 de la Adenda, "
+        "el Titular establece que el efluente cumplira la NCh 1.333. "
+        "Al respecto, se solicita al Titular presentar los antecedentes "
+        "de monitoreo y seguimiento."
+    )
+    assert audit == [
+        {
+            "tipo": "ID_anomalo_reparado",
+            "id_anomalo": "1.333.",
+            "observation_id": "7.5.",
+        }
+    ]
 
 
 def test_build_question_media_rows_skips_missing_media_refs() -> None:

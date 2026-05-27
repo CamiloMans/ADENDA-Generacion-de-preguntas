@@ -43,6 +43,27 @@ PDF_DPI = 150
 
 client: Any | None = None
 
+RE_EMBEDDED_SEC2_ID = re.compile(
+    r"\s+(?P<obs_id>\d+\.\d+\.?)\s+"
+    r"(?P<body>"
+    r"Respecto(?:\s+de|\s+del|\s+a)?|"
+    r"Con\s+respecto(?:\s+a)?|"
+    r"En\s+relaci[oó]n(?:\s+con|\s+a)?|"
+    r"Al\s+respecto|"
+    r"Se\s+solicita|"
+    r"El\s+Titular|"
+    r"La\s+Titular"
+    r")\b",
+    re.IGNORECASE,
+)
+RE_TRAILING_TOPIC_HEADING = re.compile(
+    r'([.:)\]"])\s+('
+    r"Flora\s+y\s+vegetaci[oó]n|"
+    r"Flora\s+y\s+vegetacion"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
 
 def _build_client(api_key: str) -> Any:
     try:
@@ -100,6 +121,84 @@ def _obs_id_parts(obs_id: Any) -> list[int]:
             return []
         parts.append(int(part))
     return parts
+
+
+def _canonical_obs_id(obs_id: str) -> str:
+    obs_id = obs_id.strip()
+    return obs_id if obs_id.endswith(".") else f"{obs_id}."
+
+
+def _strip_trailing_topic_heading(text: str) -> str:
+    match = RE_TRAILING_TOPIC_HEADING.search(text)
+    if not match:
+        return text.strip()
+    return text[: match.start(1) + 1].strip()
+
+
+def _split_embedded_section_question(text: str, section_num: int) -> tuple[str, str, str] | None:
+    for match in RE_EMBEDDED_SEC2_ID.finditer(text or ""):
+        obs_id = _canonical_obs_id(match.group("obs_id"))
+        if _first_number_from_obs_id(obs_id) != section_num:
+            continue
+
+        before = text[: match.start("obs_id")].strip()
+        after = text[match.start("obs_id") :].strip()
+        if before and after:
+            return before, obs_id, after
+    return None
+
+
+def _repair_cross_section_false_observations(data: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    repaired: list[dict[str, Any]] = []
+    audit: list[dict[str, Any]] = []
+
+    for obs in data:
+        obs_id = obs.get("observation_id")
+        section_num = _section_number_from_text(obs.get("section_1"))
+        obs_num = _first_number_from_obs_id(obs_id)
+
+        is_cross_section = (
+            isinstance(obs_id, str)
+            and section_num is not None
+            and obs_num is not None
+            and obs_num != section_num
+        )
+        if not is_cross_section:
+            repaired.append(obs)
+            continue
+
+        previous = repaired[-1] if repaired else None
+        previous_text = previous.get("text") if previous else None
+        split = (
+            _split_embedded_section_question(previous_text, section_num)
+            if isinstance(previous_text, str)
+            else None
+        )
+
+        if previous is not None and split is not None:
+            before, recovered_id, recovered_prefix = split
+            previous["text"] = before
+
+            recovered = copy.deepcopy(obs)
+            recovered["observation_id"] = recovered_id
+            recovered["section_1"] = previous.get("section_1") or obs.get("section_1")
+            recovered["section_2"] = previous.get("section_2") or obs.get("section_2")
+            recovered["text"] = _strip_trailing_topic_heading(
+                f"{recovered_prefix} {obs.get('text', '')}".strip()
+            )
+            repaired.append(recovered)
+            audit.append(
+                {
+                    "tipo": "ID_anomalo_reparado",
+                    "id_anomalo": obs_id,
+                    "observation_id": recovered_id,
+                }
+            )
+            continue
+
+        audit.append({"tipo": "ID_anomalo_descartado", "observation_id": obs_id})
+
+    return repaired, audit
 
 
 def _filter_parent_container_missing_ids(
@@ -755,6 +854,7 @@ def run_review(
 
     with input_json_path.open("r", encoding="utf-8") as handle:
         data = repair_mojibake_data(json.load(handle))
+    data, deterministic_audit = _repair_cross_section_false_observations(data)
     total = len(data)
     print(f"\nObservaciones cargadas: {total}")
 
@@ -775,7 +875,7 @@ def run_review(
     )
     resultado_ids["ids_faltantes"] = faltantes
     print(f"     Faltantes detectados: {faltantes if faltantes else 'ninguno'}")
-    audit_log = []
+    audit_log = list(deterministic_audit)
 
     ids_anomalos = resultado_ids.get("ids_anomalos", [])
     data, ids_anomalos_descartados = _drop_false_positive_observations(data, ids_anomalos)
