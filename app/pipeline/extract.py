@@ -210,13 +210,34 @@ def is_footer_zone(
 # PATRONES ICSARA
 # =========================================================
 
-RE_OBS = re.compile(r"^\s*((?:\d+\.){3,})\s*(.+?)\s*$")
-RE_SEC2 = re.compile(r"^\s*(\d+\.\d+\.)\s*(.+?)\s*$")
-RE_SEC1 = re.compile(r"^\s*(\d+\.)\s*(.+?)\s*$")
+RE_OBS = re.compile(r"^\s*((?:\d+\.){2,}\d+\.?)\s+(.+?)\s*$")
+RE_SEC2 = re.compile(r"^\s*(\d+\.\d+\.?)\s+(.+?)\s*$")
+RE_SEC1 = re.compile(r"^\s*(\d+\.?)\s+(.+?)\s*$")
 RE_FIG = re.compile(r"^\s*Figura\s+N[Â°Âº]?\s*\d+", re.IGNORECASE)
 RE_TABLA = re.compile(r"^\s*Tabla(?:\s+N[Â°Âº]?\s*\d+)?", re.IGNORECASE)
 RE_TABLA_STRICT = re.compile(r"^\s*Tabla\s+\S", re.IGNORECASE)
-RE_PREFIX = re.compile(r"^\s*((?:\d+\.){1,10})")
+RE_PREFIX = re.compile(r"^\s*((?:\d+\.)+\d+\.?|\d+\.?)(?=\s)")
+RE_SECTION_NUM = re.compile(r"^\s*(\d+)(?:\.|\s|$)")
+RE_TRAILING_TOPIC_HEADING = re.compile(
+    r'([.:)\]"])\s+('
+    r"Flora\s+y\s+vegetaci[oó]n|"
+    r"Flora\s+y\s+vegetacion"
+    r")\s*$",
+    re.IGNORECASE,
+)
+RE_EMBEDDED_SEC2_OBS = re.compile(
+    r"\s+(?P<prefix>\d+\.\d+\.?)\s+"
+    r"(?P<body>"
+    r"Respecto(?:\s+de|\s+del|\s+a)?|"
+    r"Con\s+respecto(?:\s+a)?|"
+    r"En\s+relaci[oó]n(?:\s+con|\s+a)?|"
+    r"Al\s+respecto|"
+    r"Se\s+solicita|"
+    r"El\s+Titular|"
+    r"La\s+Titular"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def get_prefix(text: str) -> Optional[str]:
@@ -224,10 +245,148 @@ def get_prefix(text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def canonical_numbered_id(prefix: str) -> str:
+    prefix = (prefix or "").strip()
+    return prefix if prefix.endswith(".") else f"{prefix}."
+
+
+def canonical_section_label(prefix: str, name: str) -> str:
+    return f"{canonical_numbered_id(prefix)} {name}".strip()
+
+
 def is_observation_prefix(prefix: Optional[str]) -> bool:
     if not prefix:
         return False
-    return prefix.count(".") >= 3
+    parts = [part for part in prefix.strip().split(".") if part]
+    return len(parts) >= 3
+
+
+def section_number_from_text(text: Optional[str]) -> Optional[int]:
+    if not text:
+        return None
+
+    m = RE_SECTION_NUM.match(text)
+    if not m:
+        return None
+
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def prefix_first_number(prefix: Optional[str]) -> Optional[int]:
+    if not prefix:
+        return None
+
+    first = prefix.strip().split(".", 1)[0]
+    try:
+        return int(first)
+    except ValueError:
+        return None
+
+
+def prefix_depth(prefix: Optional[str]) -> int:
+    if not prefix:
+        return 0
+    return len([part for part in prefix.strip().split(".") if part])
+
+
+def prefix_matches_section(
+    prefix: str,
+    current_sec1_name: Optional[str],
+    pending_sec1: Optional[Tuple[str, str]] = None,
+) -> bool:
+    """
+    Observation IDs must belong to the active top-level section.
+
+    This prevents legal/normative references such as "NCh 1.333.",
+    "Ley 19.300." or dates from becoming observations when they appear
+    inside another section.
+    """
+    prefix_num = prefix_first_number(prefix)
+    if prefix_num is None:
+        return True
+
+    pending_num = section_number_from_text(pending_sec1[0]) if pending_sec1 else None
+    if pending_num is not None and prefix_num == pending_num:
+        return True
+
+    current_num = section_number_from_text(current_sec1_name)
+    if current_num is None:
+        return True
+
+    return prefix_num == current_num
+
+
+def _split_text_on_embedded_observations(
+    text: str,
+    current_section_num: Optional[int],
+) -> List[str]:
+    if not text or current_section_num is None:
+        return [text]
+
+    matches = [
+        m
+        for m in RE_EMBEDDED_SEC2_OBS.finditer(text)
+        if prefix_first_number(m.group("prefix")) == current_section_num
+    ]
+    if not matches:
+        return [text]
+
+    parts: List[str] = []
+    start = 0
+    for match in matches:
+        split_at = match.start("prefix")
+        before = text[start:split_at].strip()
+        if before:
+            parts.append(before)
+        start = split_at
+
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+
+    return parts or [text]
+
+
+def split_embedded_observation_blocks(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Split text blocks where PDF extraction merged two observations.
+
+    Example:
+    "... Articulo 6 ... 7.5. Respecto de la Respuesta ..."
+
+    The split only fires for IDs matching the active section, so "NCh 1.333."
+    inside section 7 stays as content, not a new observation.
+    """
+    split_items: List[Dict[str, Any]] = []
+    current_section_num: Optional[int] = None
+
+    for item in items:
+        if item.get("kind") != "text":
+            split_items.append(item)
+            continue
+
+        text = item.get("text", "")
+        m_sec1 = RE_SEC1.match(text)
+        if m_sec1 and prefix_depth(m_sec1.group(1)) == 1:
+            sec_name = m_sec1.group(2).strip()
+            if sec_name and not re.match(r"^\d", sec_name):
+                current_section_num = section_number_from_text(m_sec1.group(1))
+
+        parts = _split_text_on_embedded_observations(text, current_section_num)
+        if len(parts) == 1:
+            split_items.append(item)
+            continue
+
+        for part in parts:
+            cloned = dict(item)
+            cloned["text"] = part
+            cloned["prefix"] = get_prefix(part)
+            split_items.append(cloned)
+
+    return split_items
 
 
 def detect_requirement_types(text: str) -> List[str]:
@@ -280,8 +439,52 @@ def detect_requirement_types(text: str) -> List[str]:
     return sorted(set(found))
 
 
+def normalizar_basico(text: str) -> str:
+    t = (text or "").lower()
+    return (
+        t.replace("á", "a")
+        .replace("é", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ú", "u")
+        .replace("ñ", "n")
+        .replace("Ã¡", "a")
+        .replace("Ã©", "e")
+        .replace("Ã­", "i")
+        .replace("Ã³", "o")
+        .replace("Ãº", "u")
+        .replace("Ã±", "n")
+    )
+
+
 def is_level2_observation_text(text: str) -> bool:
-    return len(detect_requirement_types(text)) > 0
+    m = RE_SEC2.match(text or "")
+    body = m.group(2).strip() if m else ""
+    body_norm = normalizar_basico(body)
+
+    if (
+        "siguientes observaciones" in body_norm
+        or (body.endswith(":") and len(detect_requirement_types(text)) == 0)
+    ):
+        return False
+
+    if len(detect_requirement_types(text)) > 0:
+        return True
+
+    if not m:
+        return False
+
+    return bool(
+        re.match(
+            r"^(Respecto(?:\s+de|\s+del|\s+a)?|"
+            r"Con\s+respecto(?:\s+a)?|"
+            r"En\s+relaci[oó]n(?:\s+con|\s+a)?|"
+            r"En\s+cuanto(?:\s+a)?|"
+            r"Sobre)\b",
+            body,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 # =========================================================
@@ -1782,7 +1985,7 @@ def _resolve_pending_sections(
             pending_sec1_num = int(pending_sec1[0].replace(".", ""))
             if obs_sec1_num == pending_sec1_num:
                 # Confirmado: la observaciÃ³n pertenece a esta nueva secciÃ³n
-                current_sec1_name = f"{pending_sec1[0]} {pending_sec1[1]}".strip()
+                current_sec1_name = canonical_section_label(pending_sec1[0], pending_sec1[1])
                 current_sec2_name = None
         except (ValueError, IndexError):
             pass
@@ -1792,9 +1995,9 @@ def _resolve_pending_sections(
     if pending_sec2 is not None and len(obs_parts) >= 2:
         try:
             obs_sec2_prefix = f"{obs_parts[0]}.{obs_parts[1]}."
-            if pending_sec2[0] == obs_sec2_prefix:
+            if canonical_numbered_id(pending_sec2[0]) == canonical_numbered_id(obs_sec2_prefix):
                 # Confirmado: la observaciÃ³n pertenece a esta nueva subsecciÃ³n
-                current_sec2_name = f"{pending_sec2[0]} {pending_sec2[1]}".strip()
+                current_sec2_name = canonical_section_label(pending_sec2[0], pending_sec2[1])
         except (ValueError, IndexError):
             pass
         pending_sec2 = None
@@ -1829,6 +2032,12 @@ def detect_sections_and_observations(items: List[Dict[str, Any]]) -> None:
         m_sec1 = RE_SEC1.match(text)
 
         if m_obs:
+            if not prefix_matches_section(m_obs.group(1), current_sec1_name, pending_sec1):
+                item["section_1"] = current_sec1_name
+                item["section_2"] = current_sec2_name
+                item["observation_id"] = current_obs
+                continue
+
             # Resolver secciones pendientes antes de iniciar la nueva observaciÃ³n
             (current_sec1_name, current_sec2_name,
              pending_sec1, pending_sec2) = _resolve_pending_sections(
@@ -1837,7 +2046,7 @@ def detect_sections_and_observations(items: List[Dict[str, Any]]) -> None:
                 pending_sec1, pending_sec2,
             )
 
-            current_obs = m_obs.group(1)
+            current_obs = canonical_numbered_id(m_obs.group(1))
             item["section_1"] = current_sec1_name
             item["section_2"] = current_sec2_name
             item["observation_id"] = current_obs
@@ -1847,6 +2056,12 @@ def detect_sections_and_observations(items: List[Dict[str, Any]]) -> None:
             sec2_prefix = m_sec2.group(1).strip()
             sec2_name = m_sec2.group(2).strip()
 
+            if not prefix_matches_section(sec2_prefix, current_sec1_name, pending_sec1):
+                item["section_1"] = current_sec1_name
+                item["section_2"] = current_sec2_name
+                item["observation_id"] = current_obs
+                continue
+
             if is_level2_observation_text(text):
                 # Es una observaciÃ³n de nivel 2 â€” resolver pendientes primero
                 (current_sec1_name, current_sec2_name,
@@ -1855,7 +2070,7 @@ def detect_sections_and_observations(items: List[Dict[str, Any]]) -> None:
                     current_sec1_name, current_sec2_name,
                     pending_sec1, pending_sec2,
                 )
-                current_obs = sec2_prefix
+                current_obs = canonical_numbered_id(sec2_prefix)
                 item["section_1"] = current_sec1_name
                 item["section_2"] = current_sec2_name
                 item["observation_id"] = current_obs
@@ -1863,16 +2078,20 @@ def detect_sections_and_observations(items: List[Dict[str, Any]]) -> None:
 
             if current_obs is not None:
                 # Dentro de una observaciÃ³n: guardar como pendiente
+                heading_assigned = False
                 if sec2_name and not re.match(r"^\d", sec2_name):
-                    pending_sec2 = (sec2_prefix, sec2_name)
+                    current_sec2_name = canonical_section_label(sec2_prefix, sec2_name)
+                    current_obs = None
+                    pending_sec2 = None
+                    heading_assigned = True
                 item["section_1"] = current_sec1_name
                 item["section_2"] = current_sec2_name
-                item["observation_id"] = current_obs
+                item["observation_id"] = None if heading_assigned else current_obs
                 continue
 
             # Fuera de observaciÃ³n: aplicar directamente
             if sec2_name and not re.match(r"^\d", sec2_name):
-                current_sec2_name = f"{sec2_prefix} {sec2_name}".strip()
+                current_sec2_name = canonical_section_label(sec2_prefix, sec2_name)
                 current_obs = None
                 pending_sec2 = None
 
@@ -1881,7 +2100,7 @@ def detect_sections_and_observations(items: List[Dict[str, Any]]) -> None:
             item["observation_id"] = current_obs
             continue
 
-        if m_sec1 and m_sec1.group(1).count(".") == 1:
+        if m_sec1 and prefix_depth(m_sec1.group(1)) == 1:
             sec1_prefix = m_sec1.group(1).strip()
             sec1_name = m_sec1.group(2).strip()
 
@@ -1896,7 +2115,7 @@ def detect_sections_and_observations(items: List[Dict[str, Any]]) -> None:
 
             # Fuera de observaciÃ³n: aplicar directamente
             if sec1_name and not re.match(r"^\d", sec1_name):
-                current_sec1_name = f"{sec1_prefix} {sec1_name}".strip()
+                current_sec1_name = canonical_section_label(sec1_prefix, sec1_name)
                 current_sec2_name = None
                 current_obs = None
                 pending_sec1 = None
@@ -2015,6 +2234,10 @@ def build_output(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if not m:
                 break
             full_text = full_text[: m.start(1) + 1].strip()
+
+        m_topic = RE_TRAILING_TOPIC_HEADING.search(full_text)
+        if m_topic:
+            full_text = full_text[: m_topic.start(1) + 1].strip()
 
         output.append(
             {
@@ -2249,6 +2472,7 @@ def process_pdf(pdf_path: str, base_dir: str, artifact_stem: str | None = None) 
 
     filtered_items.sort(key=lambda x: (x["page"], round(x["bbox"][1], 1), round(x["bbox"][0], 1)))
     filtered_items = remove_table_text_blocks(filtered_items)
+    filtered_items = split_embedded_observation_blocks(filtered_items)
 
     detect_sections_and_observations(filtered_items)
     filtered_items = attach_non_text_items(filtered_items)

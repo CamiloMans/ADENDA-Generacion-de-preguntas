@@ -145,7 +145,7 @@ TAXONOMIA = {
             "coliformes fecales", "coliformes totales",
             "curva de duraciÃ³n de caudales",
             "modflow", "modelo hidrogeolÃ³gico",
-            "nch 1333", "nch 409",
+            "nch 1333", "nch 1.333", "nch 409",
             "ds 90/2000", "ds 90", "ds 46/2002", "ds 46",
             "cÃ³digo de aguas", "dfl 1.122",
             "norma secundaria de calidad de aguas",
@@ -157,6 +157,7 @@ TAXONOMIA = {
             "zona de prohibiciÃ³n", "shac",
             "pit lake", "aguas halladas",
             "caudal detrÃ­tico", "canal de contorno",
+            "efluente", "efluentes",
         ],
     },
 

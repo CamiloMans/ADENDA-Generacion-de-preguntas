@@ -52,6 +52,112 @@ def _build_client(api_key: str) -> Any:
     return Anthropic(api_key=api_key)
 
 
+def _obs_id_search_patterns(obs_id: str) -> list[str]:
+    parts = [re.escape(part) for part in obs_id.rstrip(".").split(".") if part]
+    if not parts:
+        return []
+
+    dotted = r"\s*\.\s*".join(parts)
+    spaced = r"\s+".join(parts)
+    return [
+        rf"(?<![\d.]){dotted}\s*\.(?!\d)",
+        rf"(?m)(?:^|\s){spaced}(?=\s+[A-ZÁÉÍÓÚÑ])",
+    ]
+
+
+def _section_number_from_text(text: Any) -> int | None:
+    if not isinstance(text, str):
+        return None
+
+    match = re.match(r"^\s*(\d+)\.", text)
+    if not match:
+        return None
+
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _first_number_from_obs_id(obs_id: Any) -> int | None:
+    if not isinstance(obs_id, str):
+        return None
+
+    first = obs_id.strip().split(".", 1)[0]
+    try:
+        return int(first)
+    except ValueError:
+        return None
+
+
+def _obs_id_parts(obs_id: Any) -> list[int]:
+    if not isinstance(obs_id, str):
+        return []
+
+    parts: list[int] = []
+    for part in obs_id.strip().strip(".").split("."):
+        if not part.isdigit():
+            return []
+        parts.append(int(part))
+    return parts
+
+
+def _filter_parent_container_missing_ids(
+    faltantes: list[Any],
+    existing_ids: list[Any],
+) -> list[Any]:
+    existing_parts = [_obs_id_parts(obs_id) for obs_id in existing_ids]
+    filtered: list[Any] = []
+
+    for missing in faltantes:
+        missing_parts = _obs_id_parts(missing)
+        if missing_parts and any(
+            len(parts) > len(missing_parts)
+            and parts[: len(missing_parts)] == missing_parts
+            for parts in existing_parts
+        ):
+            continue
+        filtered.append(missing)
+
+    return filtered
+
+
+def _is_probably_false_positive_observation(obs: dict[str, Any], ids_anomalos: set[str]) -> bool:
+    obs_id = obs.get("observation_id")
+    if not isinstance(obs_id, str) or obs_id not in ids_anomalos:
+        return False
+
+    section_num = _section_number_from_text(obs.get("section_1"))
+    obs_num = _first_number_from_obs_id(obs_id)
+    if section_num is not None and obs_num is not None and section_num != obs_num:
+        return True
+
+    text = obs.get("text", "")
+    if isinstance(text, str) and re.match(r"^\s*\d{1,2}\.\d{2}\.\d{4}\.", text):
+        return True
+
+    return False
+
+
+def _drop_false_positive_observations(
+    data: list[dict[str, Any]],
+    ids_anomalos: list[Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    anomalos = {item for item in ids_anomalos if isinstance(item, str)}
+    if not anomalos:
+        return data, []
+
+    filtered: list[dict[str, Any]] = []
+    removed: list[str] = []
+    for obs in data:
+        if _is_probably_false_positive_observation(obs, anomalos):
+            removed.append(obs["observation_id"])
+            continue
+        filtered.append(obs)
+
+    return filtered, removed
+
+
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # MÃ“DULO PDF
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -88,15 +194,12 @@ class LectorPDF:
         Devuelve los nÃºmeros de pÃ¡gina (0-indexed) donde aparece obs_id.
         Busca el ID con los formatos habituales del ICSARA.
         """
-        variantes = [
-            obs_id,
-            obs_id.rstrip("."),
-            obs_id.replace(".", " "),
-        ]
+        patrones = _obs_id_search_patterns(obs_id)
+        variantes = [obs_id, obs_id.replace(".", " ")]
         encontradas = set()
         for n in range(self.n_paginas):
             texto = self.texto_pagina(n)
-            if any(v in texto for v in variantes):
+            if any(re.search(patron, texto) for patron in patrones) or any(v in texto for v in variantes):
                 encontradas.add(n)
         # Incluye pÃ¡gina siguiente por si la observaciÃ³n ocupa dos pÃ¡ginas
         return sorted(encontradas | {p + 1 for p in encontradas if p + 1 < self.n_paginas})
@@ -175,6 +278,9 @@ Algunos IDs son de nivel superior sin nÃºmero final (ej: 4.1., 9.1., 13.2.).
 
 Identifica Ãºnicamente los IDs que claramente faltan en la secuencia numÃ©rica.
 No marques como faltante un salto que podrÃ­a ser intencional en el documento original.
+No interpretes referencias normativas, normas tÃ©cnicas, leyes o fechas como observation_id.
+Ejemplos que deben ir en "ids_anomalos" si aparecen como ID: NCh 1.333., Ley 19.300.,
+D.S. 148/2003, fechas tipo 15.05.2024.
 
 Responde ÃšNICAMENTE con JSON vÃ¡lido:
 {{
@@ -252,6 +358,8 @@ def extraer_obs_desde_pdf(
 
 Debes extraer FIELMENTE la observaciÃ³n con ID **{obs_id}** de las imÃ¡genes del PDF adjuntas.
 No corrijas redacciÃ³n ni ortografÃ­a. Copia el texto exactamente como aparece en el PDF.
+No conviertas referencias normativas en nuevas observaciones. Ejemplo: "NCh 1.333."
+es parte del texto, no un ID de observaciÃ³n.
 
 Contexto de lÃ­mites:
 - {contexto_prev}
@@ -360,6 +468,8 @@ Tu misiÃ³n es verificar que la extracciÃ³n del texto y las tablas sea FIEL A
 NO debes corregir la redacciÃ³n, ortografÃ­a ni el estilo del texto.
 Solo debes detectar errores de extracciÃ³n: texto cortado, texto ajeno incluido,
 o tablas distorsionadas por OCR.
+No trates referencias normativas como observation_id. Ejemplo: "NCh 1.333."
+debe permanecer dentro del texto de la observaciÃ³n correspondiente.
 
 â•â• OBSERVACIÃ“N A VERIFICAR â•â•
 ID: {obs_id}
@@ -659,8 +769,20 @@ def run_review(
     print("\n[C1] Verificando completitud de la secuencia de IDs...")
     todos_ids = [d["observation_id"] for d in data]
     resultado_ids = detectar_ids_faltantes(todos_ids)
-    faltantes = resultado_ids.get("ids_faltantes", [])
+    faltantes = _filter_parent_container_missing_ids(
+        resultado_ids.get("ids_faltantes", []),
+        todos_ids,
+    )
+    resultado_ids["ids_faltantes"] = faltantes
     print(f"     Faltantes detectados: {faltantes if faltantes else 'ninguno'}")
+    audit_log = []
+
+    ids_anomalos = resultado_ids.get("ids_anomalos", [])
+    data, ids_anomalos_descartados = _drop_false_positive_observations(data, ids_anomalos)
+    if ids_anomalos_descartados:
+        print(f"     IDs anomalos descartados: {ids_anomalos_descartados}")
+        for oid in ids_anomalos_descartados:
+            audit_log.append({"tipo": "ID_anomalo_descartado", "observation_id": oid})
 
     data_map = {d["observation_id"]: d for d in data}
     for fid in faltantes:
@@ -682,7 +804,6 @@ def run_review(
 
     n_c1_extraidas = 0
     n_c1_no_localizadas = 0
-    audit_log = []
 
     for i, obs in enumerate(data_completa):
         if not obs.get("_pendiente_c1"):

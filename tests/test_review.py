@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from app.pipeline.review import aplicar_correcciones
+import fitz
+
+from app.pipeline.review import (
+    LectorPDF,
+    _drop_false_positive_observations,
+    _filter_parent_container_missing_ids,
+    aplicar_correcciones,
+)
 from app.services.google_drive_service import DriveFileRef
 from app.services.result_service import _build_question_media_rows
 
@@ -74,6 +81,49 @@ def test_aplicar_correcciones_replaces_symbolic_table_ref_with_original_file() -
 
     assert corregida["tables"][0]["table_file"] == "C:/tmp/page_045_table_001.png"
     assert corregida["tables"][0]["rows"] == [["fusionada"]]
+
+
+def test_drop_false_positive_observations_removes_anomalous_cross_section_id() -> None:
+    data = [
+        {
+            "observation_id": "7.4.",
+            "section_1": "7. Efectos, caracteristicas o circunstancias",
+            "text": "7.4. Texto valido.",
+        },
+        {
+            "observation_id": "1.333.",
+            "section_1": "7. Efectos, caracteristicas o circunstancias",
+            "text": "1.333. Al respecto, se solicita monitoreo.",
+        },
+    ]
+
+    filtered, removed = _drop_false_positive_observations(data, ["1.333."])
+
+    assert removed == ["1.333."]
+    assert [item["observation_id"] for item in filtered] == ["7.4."]
+
+
+def test_lector_pdf_finds_observation_id_with_spaces_around_dot(tmp_path) -> None:
+    pdf_path = tmp_path / "sample.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "7.5 . Respecto de la Respuesta 6.5.4 de la Adenda")
+    doc.save(pdf_path)
+    doc.close()
+
+    lector = LectorPDF(str(pdf_path))
+
+    assert lector.buscar_paginas_obs("7.5.") == [0]
+    lector.doc.close()
+
+
+def test_filter_parent_container_missing_ids_keeps_real_gaps_only() -> None:
+    filtered = _filter_parent_container_missing_ids(
+        ["1.5.", "1.6.", "7.5."],
+        ["1.5.1.", "1.5.2.", "1.6.1.", "7.4.", "7.6."],
+    )
+
+    assert filtered == ["7.5."]
 
 
 def test_build_question_media_rows_skips_missing_media_refs() -> None:
