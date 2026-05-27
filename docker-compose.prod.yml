@@ -21,6 +21,8 @@ services:
       - redis
     volumes:
       - ./data:/data
+      - ./client_secret.json:/app/client_secret.json:ro
+      - ./token.json:/app/token.json
     ports:
       - "8080:8000"
     logging: *default-logging
@@ -38,4 +40,6 @@ services:
       - redis
     volumes:
       - ./data:/data
+      - ./client_secret.json:/app/client_secret.json:ro
+      - ./token.json:/app/token.json
     logging: *default-logging
