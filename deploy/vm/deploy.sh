@@ -16,6 +16,7 @@ git checkout "$BRANCH"
 git pull --ff-only origin "$BRANCH"
 
 docker compose -f docker-compose.prod.yml up -d redis
+docker compose -f docker-compose.prod.yml build api worker
 docker compose -f docker-compose.prod.yml run --rm api alembic upgrade head
-docker compose -f docker-compose.prod.yml up -d --build api worker
+docker compose -f docker-compose.prod.yml up -d api worker
 docker compose -f docker-compose.prod.yml ps
