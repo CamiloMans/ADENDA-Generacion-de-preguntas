@@ -253,3 +253,41 @@ def test_build_question_media_rows_skips_unresolvable_media_refs() -> None:
     assert len(rows) == 1
     assert rows[0].tipo == "tabla"
     assert rows[0].filename == "tabla_001.png"
+
+
+def test_filter_non_interior_missing_ids_drops_invented_ranges() -> None:
+    from app.pipeline.review import _filter_non_interior_missing_ids
+
+    existing = ["2.4", "3.2.1", "3.2.3", "3.2.5", "3.3.1", "4.1.1"]
+
+    # Hueco interior real: 3.2.2 y 3.2.4 tienen hermanos a ambos lados.
+    keep, dropped = _filter_non_interior_missing_ids(
+        ["3.2.2", "3.2.4"], existing
+    )
+    assert keep == ["3.2.2", "3.2.4"]
+    assert dropped == []
+
+    # Rango inventado: 3.1.x no tiene ningun hermano existente.
+    keep, dropped = _filter_non_interior_missing_ids(
+        ["3.1.1", "3.1.2", "3.1.3", "3.1.4", "3.1.5"], existing
+    )
+    assert keep == []
+    assert dropped == ["3.1.1", "3.1.2", "3.1.3", "3.1.4", "3.1.5"]
+
+    # Extremo de secuencia (3.2.6 solo tiene hermanos menores): no interior.
+    keep, dropped = _filter_non_interior_missing_ids(["3.2.6"], existing)
+    assert keep == []
+    assert dropped == ["3.2.6"]
+
+
+def test_c1_extraccion_fallida_detects_placeholders() -> None:
+    from app.pipeline.review import _c1_extraccion_fallida
+
+    assert _c1_extraccion_fallida({"_c1_no_localizado": True, "text": "x"})
+    assert _c1_extraccion_fallida({"_c1_error": "boom", "text": "x"})
+    assert _c1_extraccion_fallida(
+        {"text": "[NO VISIBLE EN PAGINAS ADJUNTAS - requiere revision manual]"}
+    )
+    assert _c1_extraccion_fallida({"text": "[NO LOCALIZADO EN PDF - ID 3.1.2]"})
+    assert _c1_extraccion_fallida({"text": ""})  # texto vacio = sin contenido real
+    assert not _c1_extraccion_fallida({"text": "3.2.2 Se debera complementar..."})

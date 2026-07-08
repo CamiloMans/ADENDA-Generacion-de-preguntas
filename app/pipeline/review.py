@@ -221,6 +221,36 @@ def _filter_parent_container_missing_ids(
     return filtered
 
 
+def _filter_non_interior_missing_ids(
+    faltantes: list[Any],
+    existing_ids: list[Any],
+) -> tuple[list[Any], list[Any]]:
+    """Solo acepta huecos INTERIORES: el ID faltante debe tener hermanos
+    existentes (mismo padre, mismo nivel) antes Y despues en la secuencia.
+    Evita que el detector invente rangos completos (ej. 3.1.1-3.1.5) para
+    subsecciones que no tienen hijos numerados en el documento original."""
+    existing_parts = [_obs_id_parts(obs_id) for obs_id in existing_ids]
+    keep: list[Any] = []
+    dropped: list[Any] = []
+
+    for missing in faltantes:
+        parts = _obs_id_parts(missing)
+        if not parts:
+            dropped.append(missing)
+            continue
+        parent, last = parts[:-1], parts[-1]
+        siblings = [
+            p[-1] for p in existing_parts
+            if len(p) == len(parts) and p[:-1] == parent
+        ]
+        if any(s < last for s in siblings) and any(s > last for s in siblings):
+            keep.append(missing)
+        else:
+            dropped.append(missing)
+
+    return keep, dropped
+
+
 def _is_probably_false_positive_observation(obs: dict[str, Any], ids_anomalos: set[str]) -> bool:
     obs_id = obs.get("observation_id")
     if not isinstance(obs_id, str) or obs_id not in ids_anomalos:
@@ -514,6 +544,23 @@ Si el texto no fue localizable en las pÃ¡ginas adjuntas, "text" debe ser:
             "tables": [], "section_2": None, "requirement_types": [],
             "_c1_error": str(e)
         }
+
+
+RE_C1_TEXTO_FALLIDO = re.compile(
+    r"^\s*\[\s*(NO VISIBLE|NO LOCALIZADO|PDF NO DISPONIBLE|ERROR DE PARSEO)",
+    re.IGNORECASE,
+)
+
+
+def _c1_extraccion_fallida(extraccion: dict) -> bool:
+    """True si la extraccion C1 no obtuvo texto real del PDF (flags de error
+    o texto marcador tipo '[NO VISIBLE EN PAGINAS ADJUNTAS...]')."""
+    if extraccion.get("_c1_no_localizado") or extraccion.get("_c1_error"):
+        return True
+    text = (extraccion.get("text") or "").strip()
+    if not text:
+        return True
+    return bool(RE_C1_TEXTO_FALLIDO.match(text))
 
 
 def rellenar_obs_vacia(obs: dict, extraccion: dict) -> dict:
@@ -873,9 +920,21 @@ def run_review(
         resultado_ids.get("ids_faltantes", []),
         todos_ids,
     )
+    faltantes, faltantes_no_interiores = _filter_non_interior_missing_ids(
+        faltantes,
+        todos_ids,
+    )
     resultado_ids["ids_faltantes"] = faltantes
+    resultado_ids["ids_faltantes_descartados_no_interiores"] = faltantes_no_interiores
     print(f"     Faltantes detectados: {faltantes if faltantes else 'ninguno'}")
+    if faltantes_no_interiores:
+        print(
+            "     Faltantes descartados (sin hermanos existentes a ambos lados): "
+            f"{faltantes_no_interiores}"
+        )
     audit_log = list(deterministic_audit)
+    for oid in faltantes_no_interiores:
+        audit_log.append({"tipo": "C1_faltante_descartado_no_interior", "observation_id": oid})
 
     ids_anomalos = resultado_ids.get("ids_anomalos", [])
     data, ids_anomalos_descartados = _drop_false_positive_observations(data, ids_anomalos)
@@ -926,24 +985,37 @@ def run_review(
                 "_c1_no_localizado": True,
             }
 
-        data_completa[i] = rellenar_obs_vacia(obs, extraccion)
-        audit_log.append(
-            {
-                "tipo": "C1_extraccion",
-                "observation_id": oid,
-                "paginas": extraccion.get("_paginas_consultadas", []),
-                "no_localizado": extraccion.get("_c1_no_localizado", False),
-            }
-        )
-
-        if extraccion.get("_c1_no_localizado") or extraccion.get("_c1_error"):
+        if _c1_extraccion_fallida(extraccion):
+            # Sin texto real en el PDF: descartar la observacion inventada en
+            # vez de insertarla con un marcador en la salida final.
+            obs["_c1_descartar"] = True
             n_c1_no_localizadas += 1
-            print("no localizado")
+            audit_log.append(
+                {
+                    "tipo": "C1_descartada_sin_texto_en_pdf",
+                    "observation_id": oid,
+                    "paginas": extraccion.get("_paginas_consultadas", []),
+                }
+            )
+            print("no localizado -> descartada")
         else:
+            data_completa[i] = rellenar_obs_vacia(obs, extraccion)
+            audit_log.append(
+                {
+                    "tipo": "C1_extraccion",
+                    "observation_id": oid,
+                    "paginas": extraccion.get("_paginas_consultadas", []),
+                    "no_localizado": False,
+                }
+            )
             n_c1_extraidas += 1
             print("extraido")
 
         time.sleep(1)
+
+    if n_c1_no_localizadas:
+        data_completa = [o for o in data_completa if not o.get("_c1_descartar")]
+        total_final = len(data_completa)
 
     print(f"\n[C2+C3] Verificando fidelidad de extraccion ({total_final} observaciones)...")
     resultados_obs = []
