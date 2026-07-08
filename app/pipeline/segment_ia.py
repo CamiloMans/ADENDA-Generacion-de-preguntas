@@ -254,7 +254,14 @@ Reglas estrictas:
    del elemento abierto.
 6. Una observación NO termina por un salto de página: termina cuando
    empieza otra observación, otro título, o el documento cambia de materia.
-7. Responde SOLO el JSON, sin comentarios ni markdown."""
+7. Usa seccion_2 SOLO para títulos o preámbulos que introducen una lista de
+   observaciones numeradas (ej: "3.2 Respecto de los antecedentes... se
+   señala:" seguido de 3.2.1, 3.2.2...). Si un número de subsección (ej:
+   "3.1") va seguido de texto sustantivo dirigido al titular (un
+   pronunciamiento, aclaración o requerimiento) y NO tiene
+   sub-observaciones numeradas debajo, etiqueta TODO ese bloque como
+   observacion con id "3.1." — no como seccion_2 ni contexto.
+8. Responde SOLO el JSON, sin comentarios ni markdown."""
 
 
 def _construir_mensaje_lote(doc, lineas_lote, paginas, estado_abierto):
@@ -928,6 +935,27 @@ def ensamblar(doc, pdf_path, lineas, segmentos, out_dir, stem) -> Tuple[List[Dic
     tabla_pend: List[List[Dict]] = []
     tabla_pend_obs: Optional[str] = None
 
+    # Subsección "huérfana": seccion_2 con texto sustantivo que nunca recibe
+    # observaciones hijas (ej. "3.1 En relación con... no se intervendrán...").
+    # Se promueve a observación propia para no perder su contenido.
+    MIN_CHARS_SEC2_HUERFANA = 150
+    RE_NUM_PREFIJO = re.compile(r"^\s*((?:\d+\.)*\d+\.?)(?=\s)")
+    sec2_pend: Optional[Dict] = None  # {"texto", "ls", "sec1"}
+
+    def promover_sec2_huerfana():
+        nonlocal sec2_pend
+        pend, sec2_pend = sec2_pend, None
+        if not pend or len(pend["texto"]) < MIN_CHARS_SEC2_HUERFANA:
+            return
+        m = RE_NUM_PREFIJO.match(pend["texto"])
+        oid = (m.group(1) if m else f"SEC-{len(orden_obs) + 1}").strip()
+        if oid in obs_map:
+            return
+        obs_map[oid] = {"observation_id": oid, "section_1": pend["sec1"],
+                        "section_2": None, "lineas": list(pend["ls"]),
+                        "tables": [], "images": []}
+        orden_obs.append(oid)
+
     def cerrar_tabla_pendiente():
         nonlocal n_tabla, tabla_pend, tabla_pend_obs
         if tabla_pend and tabla_pend_obs and tabla_pend_obs in obs_map:
@@ -953,10 +981,14 @@ def ensamblar(doc, pdf_path, lineas, segmentos, out_dir, stem) -> Tuple[List[Dic
         if tipo == "contexto":
             continue
         if tipo == "seccion_1":
+            promover_sec2_huerfana()
             sec1 = unir_lineas([l["text"] for l in ls]); sec2 = None; obs_actual = None
         elif tipo == "seccion_2":
+            promover_sec2_huerfana()
             sec2 = unir_lineas([l["text"] for l in ls]); obs_actual = None
+            sec2_pend = {"texto": sec2, "ls": ls, "sec1": sec1}
         elif tipo == "observacion":
+            sec2_pend = None  # la subsección tuvo hijas: es bisagra, no huérfana
             oid = (s.get("id") or f"OBS-{len(orden_obs) + 1}").strip()
             if oid not in obs_map:
                 obs_map[oid] = {"observation_id": oid, "section_1": sec1,
@@ -970,6 +1002,7 @@ def ensamblar(doc, pdf_path, lineas, segmentos, out_dir, stem) -> Tuple[List[Dic
                 {"image_file": None,
                  "caption": unir_lineas([l["text"] for l in ls])})
     cerrar_tabla_pendiente()
+    promover_sec2_huerfana()
 
     # ── Imágenes reales del PDF: extraer y asociar a observaciones ──────────
     imagenes = extraer_imagenes_doc(doc, images_dir, lineas_por_pagina)
