@@ -2352,7 +2352,13 @@ def build_summary(output: List[Dict[str, Any]], tables_document: Dict[str, Any])
 
 def _log(msg: str) -> None:
     """Print con flush inmediato para progreso en vivo."""
-    print(msg, flush=True)
+    # Consolas Windows cp1252 no soportan todos los caracteres; degradar sin fallar.
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        import sys
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(msg.encode(enc, errors="replace").decode(enc), flush=True)
 
 
 def process_pdf(pdf_path: str, base_dir: str, artifact_stem: str | None = None) -> Tuple[str, str, str]:
@@ -2529,6 +2535,49 @@ def process_pdf(pdf_path: str, base_dir: str, artifact_stem: str | None = None) 
 
 
 def run_extraction(
+    pdf_path: Path | str,
+    out_dir: Path | str,
+    include_png: bool = True,
+    artifact_stem: str | None = None,
+) -> ExtractionSummary:
+    """Motor de extracción del pipeline.
+
+    Por defecto usa la segmentación con IA (app.pipeline.segment_ia, port de
+    segmentador_ia_icsara v2.0: la IA señala límites, el código ensambla
+    textual). Control por variables de entorno:
+      ICSARA_EXTRACTION_ENGINE = "ia" (default) | "heuristic"
+      ICSARA_IA_FALLBACK_HEURISTIC = "true" (default) | "false"
+    Con fallback activo, cualquier fallo de la vía IA (sin API key, error de
+    etiquetado, etc.) se registra y el job continúa con el parser heurístico.
+    """
+    engine = os.getenv("ICSARA_EXTRACTION_ENGINE", "ia").strip().lower()
+    if engine != "heuristic":
+        try:
+            from app.pipeline.segment_ia import run_extraction_ia
+
+            return run_extraction_ia(
+                pdf_path=pdf_path,
+                out_dir=out_dir,
+                artifact_stem=artifact_stem,
+            )
+        except Exception:
+            fallback = os.getenv("ICSARA_IA_FALLBACK_HEURISTIC", "true").strip().lower()
+            if fallback in ("0", "false", "no"):
+                raise
+            import logging
+            logging.getLogger(__name__).exception(
+                "Segmentación IA falló; usando parser heurístico como respaldo."
+            )
+
+    return _run_extraction_heuristic(
+        pdf_path=pdf_path,
+        out_dir=out_dir,
+        include_png=include_png,
+        artifact_stem=artifact_stem,
+    )
+
+
+def _run_extraction_heuristic(
     pdf_path: Path | str,
     out_dir: Path | str,
     include_png: bool = True,
