@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.health import router as health_router
 from app.api.routes.jobs import router as jobs_router
+from app.api.routes.media import router as media_router
 from app.core.config import get_settings
 from app.db.base import Base
 from app.db.session import engine
@@ -41,3 +42,4 @@ elif settings.cors_origin_list:
 
 app.include_router(health_router, prefix="/v1")
 app.include_router(jobs_router, prefix="/v1")
+app.include_router(media_router, prefix="/v1")
