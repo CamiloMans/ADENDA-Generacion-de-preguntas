@@ -32,7 +32,8 @@ Copy `.env.example` to `.env` and set:
 - `GOOGLE_CLIENT_SECRET_FILE`
 - `GOOGLE_TOKEN_FILE`
 - `GOOGLE_DRIVE_PARENT_FOLDER_ID`
-- `ANTHROPIC_API_KEY`
+- `ANTHROPIC_ADENDA_VALIDACION_ICSARA_API_KEY`
+- `ANTHROPIC_API_KEY` (legacy fallback)
 - `ANTHROPIC_MODEL`
 - `ANTHROPIC_PDF_DPI`
 - `CORS_ALLOW_ALL` (`true` for temporary wildcard CORS, otherwise use `CORS_ORIGINS`)

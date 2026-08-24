@@ -237,7 +237,7 @@ def test_process_job_persists_dynamic_artifacts_rewrites_media_and_cleans_local_
     settings.data_dir = tmp_path / "jobs"
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.google_drive_parent_folder_id = "parent-folder"
-    settings.anthropic_api_key = "test-key"
+    settings.anthropic_adenda_validacion_icsara_api_key = "test-key"
     settings.anthropic_model = "claude-test"
 
     job_id = uuid4()
@@ -344,7 +344,7 @@ def test_process_job_replaces_previous_adenda_artifacts(monkeypatch, tmp_path) -
     settings.data_dir = tmp_path / "jobs"
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.google_drive_parent_folder_id = "parent-folder"
-    settings.anthropic_api_key = "test-key"
+    settings.anthropic_adenda_validacion_icsara_api_key = "test-key"
     settings.anthropic_model = "claude-test"
 
     first_job_id = uuid4()
@@ -424,6 +424,7 @@ def test_process_job_fails_when_anthropic_config_is_missing(monkeypatch, tmp_pat
     settings.data_dir = tmp_path / "jobs"
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.google_drive_parent_folder_id = "parent-folder"
+    settings.anthropic_adenda_validacion_icsara_api_key = ""
     settings.anthropic_api_key = ""
     settings.anthropic_model = ""
 
@@ -453,7 +454,7 @@ def test_process_job_fails_when_anthropic_config_is_missing(monkeypatch, tmp_pat
     result = pipeline_tasks.process_job(str(job_id))
 
     assert result["status"] == "failed"
-    assert "ANTHROPIC_API_KEY" in result["error"]
+    assert "ANTHROPIC_ADENDA_VALIDACION_ICSARA_API_KEY" in result["error"]
 
 
 def test_process_job_marks_failure_and_cleans_drive_run_on_review_error(monkeypatch, tmp_path) -> None:
@@ -461,7 +462,7 @@ def test_process_job_marks_failure_and_cleans_drive_run_on_review_error(monkeypa
     settings.data_dir = tmp_path / "jobs"
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.google_drive_parent_folder_id = "parent-folder"
-    settings.anthropic_api_key = "test-key"
+    settings.anthropic_adenda_validacion_icsara_api_key = "test-key"
     settings.anthropic_model = "claude-test"
 
     job_id = uuid4()

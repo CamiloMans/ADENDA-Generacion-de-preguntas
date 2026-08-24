@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     google_client_secret_file: Path = Path("client_secret.json")
     google_token_file: Path = Path("token.json")
     google_drive_parent_folder_id: str = ""
+    anthropic_adenda_validacion_icsara_api_key: str = ""
     anthropic_api_key: str = ""
     anthropic_model: str = ""
     anthropic_pdf_dpi: int = 150
@@ -36,6 +37,14 @@ class Settings(BaseSettings):
     @property
     def api_key_set(self) -> set[str]:
         return {key.strip() for key in self.api_keys.split(",") if key.strip()}
+
+    @property
+    def anthropic_validacion_icsara_api_key(self) -> str:
+        """Return the dedicated ICSARA key, falling back to the legacy key."""
+        return (
+            self.anthropic_adenda_validacion_icsara_api_key.strip()
+            or self.anthropic_api_key.strip()
+        )
 
     @property
     def cors_origin_list(self) -> list[str]:

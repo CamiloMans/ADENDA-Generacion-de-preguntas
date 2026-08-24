@@ -881,7 +881,10 @@ def run_review(
     pdf_dpi: int = 150,
 ) -> ReviewSummary:
     if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY is required for the review stage.")
+        raise ValueError(
+            "ANTHROPIC_ADENDA_VALIDACION_ICSARA_API_KEY is required for the review stage "
+            "(ANTHROPIC_API_KEY remains available as a legacy fallback)."
+        )
     if not model:
         raise ValueError("ANTHROPIC_MODEL is required for the review stage.")
 
@@ -1091,7 +1094,10 @@ def main():
         INPUT_PDF,
         out_dir,
         artifact_stem,
-        api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+        api_key=(
+            os.getenv("ANTHROPIC_ADENDA_VALIDACION_ICSARA_API_KEY", "")
+            or os.getenv("ANTHROPIC_API_KEY", "")
+        ),
         model=MODEL_ID,
         pdf_dpi=PDF_DPI,
     )

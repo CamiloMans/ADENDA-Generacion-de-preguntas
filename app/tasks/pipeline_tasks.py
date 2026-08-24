@@ -183,7 +183,7 @@ def process_job(job_id: str, classify: bool = True, include_png: bool = True) ->
             input_pdf_path=input_pdf,
             out_dir=out_dir,
             artifact_stem=artifact_stem,
-            api_key=settings.anthropic_api_key,
+            api_key=settings.anthropic_validacion_icsara_api_key,
             model=settings.anthropic_model,
             pdf_dpi=settings.anthropic_pdf_dpi,
         )

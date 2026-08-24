@@ -326,7 +326,7 @@ def etiquetar_con_ia(doc, lineas, api_key: str, model: str,
     if not api_key:
         raise RuntimeError(
             "Segmentación IA requiere una API key de Anthropic "
-            "(settings.anthropic_api_key o variable ANTHROPIC_API_KEY)."
+            "(ANTHROPIC_ADENDA_VALIDACION_ICSARA_API_KEY o ANTHROPIC_API_KEY)."
         )
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -1151,7 +1151,8 @@ def _resolver_credenciales(api_key: Optional[str], model: Optional[str]) -> Tupl
     except Exception:
         pass
     api_key = (api_key or
-               (settings.anthropic_api_key if settings else "") or
+               (settings.anthropic_validacion_icsara_api_key if settings else "") or
+               os.environ.get("ANTHROPIC_ADENDA_VALIDACION_ICSARA_API_KEY", "") or
                os.environ.get("ANTHROPIC_API_KEY", ""))
     model = (model or
              os.environ.get("SEGMENTADOR_MODEL", "").strip() or

@@ -82,7 +82,8 @@ Edit `.env` and set real values:
 - `GOOGLE_CLIENT_SECRET_FILE`
 - `GOOGLE_TOKEN_FILE`
 - `GOOGLE_DRIVE_PARENT_FOLDER_ID`
-- `ANTHROPIC_API_KEY`
+- `ANTHROPIC_ADENDA_VALIDACION_ICSARA_API_KEY`
+- `ANTHROPIC_API_KEY` (fallback heredado opcional)
 - `ANTHROPIC_MODEL`
 - keep `ANTHROPIC_PDF_DPI=150` unless you need a different review DPI
 - keep `CORS_ALLOW_ALL=true` (temporary)
