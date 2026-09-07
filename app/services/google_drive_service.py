@@ -12,7 +12,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
 
 from app.core.config import get_settings
 
@@ -41,6 +41,18 @@ class DriveFileRef:
     download_url: str
     size_bytes: int
     sha256: str
+
+
+@dataclass(slots=True)
+class DriveChild:
+    file_id: str
+    name: str
+    mime_type: str
+    web_view_url: str
+
+    @property
+    def is_folder(self) -> bool:
+        return self.mime_type == DRIVE_FOLDER_MIME_TYPE
 
 
 @dataclass(slots=True)
@@ -180,6 +192,7 @@ class GoogleDriveService:
                 spaces="drive",
                 fields="files(id, name)",
                 pageSize=10,
+                corpora="allDrives",
                 includeItemsFromAllDrives=True,
                 supportsAllDrives=True,
             ).execute()
@@ -261,6 +274,66 @@ class GoogleDriveService:
             self._service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
         except HttpError as exc:
             raise DriveServiceError(f"Could not delete Google Drive file '{file_id}'.") from exc
+
+    def list_children(self, folder_id: str) -> list[DriveChild]:
+        """Return every non-trashed direct child (files and folders) of a folder."""
+        children: list[DriveChild] = []
+        page_token: str | None = None
+        while True:
+            try:
+                response = self._service.files().list(
+                    q=f"trashed=false and '{folder_id}' in parents",
+                    spaces="drive",
+                    fields="nextPageToken, files(id, name, mimeType, webViewLink)",
+                    pageSize=1000,
+                    pageToken=page_token,
+                    corpora="allDrives",
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                ).execute()
+            except HttpError as exc:
+                raise DriveServiceError(f"Could not list Google Drive folder '{folder_id}'.") from exc
+            for item in response.get("files", []):
+                children.append(
+                    DriveChild(
+                        file_id=item["id"],
+                        name=item["name"],
+                        mime_type=item.get("mimeType", ""),
+                        web_view_url=item.get("webViewLink") or self.file_view_url(item["id"]),
+                    )
+                )
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                return children
+
+    def copy_file(self, *, file_id: str, name: str, parent_id: str) -> DriveChild:
+        """Server-side copy of a file into another folder (works across shared drives)."""
+        try:
+            copied = self._service.files().copy(
+                fileId=file_id,
+                body={"name": name, "parents": [parent_id]},
+                fields="id, name, mimeType, webViewLink",
+                supportsAllDrives=True,
+            ).execute()
+        except HttpError as exc:
+            raise DriveServiceError(f"Could not copy Google Drive file '{file_id}'.") from exc
+        return DriveChild(
+            file_id=copied["id"],
+            name=copied["name"],
+            mime_type=copied.get("mimeType", ""),
+            web_view_url=copied.get("webViewLink") or self.file_view_url(copied["id"]),
+        )
+
+    def update_file_content(self, *, file_id: str, content: bytes, mime_type: str) -> None:
+        media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
+        try:
+            self._service.files().update(
+                fileId=file_id,
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute()
+        except HttpError as exc:
+            raise DriveServiceError(f"Could not update Google Drive file '{file_id}'.") from exc
 
     @staticmethod
     def folder_url(folder_id: str) -> str:

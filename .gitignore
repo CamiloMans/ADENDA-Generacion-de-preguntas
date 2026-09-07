@@ -19,3 +19,5 @@ venv/
 *.db
 *.sqlite
 *.sqlite3
+
+scripts/out/
